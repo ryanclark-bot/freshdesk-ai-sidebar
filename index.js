@@ -56,21 +56,23 @@ function uniqById(tickets) {
 /**
  * Your Freshdesk requires query wrapped in double quotes:
  *   query="status:2"
- * And it supports pagination via `page` but NOT `per_page`.
+ * It supports pagination via `page`, but page MUST be <= 10.
  */
-async function searchTicketsPaged(rawQuery, pages = 10) {
+async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   const query = `"${rawQuery}"`;
   const all = [];
 
-  for (let page = 1; page <= pages; page++) {
+  const maxPages = Math.min(Math.max(1, Number(maxPagesRequested) || 1), 10);
+
+  for (let page = 1; page <= maxPages; page++) {
     const { data } = await fd.get(`/search/tickets`, {
-      params: { query, page }, // <-- no per_page
+      params: { query, page }, // no per_page
     });
 
     const results = Array.isArray(data?.results) ? data.results : [];
     all.push(...results);
 
-    // If an empty page is returned, we’ve hit the end.
+    // stop early if we hit the end
     if (results.length === 0) break;
   }
 
@@ -121,10 +123,10 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    /* ---------- 3) Candidate pool: resolved + closed (paged) ---------- */
+    /* ---------- 3) Candidate pool: resolved + closed (paged, max 10 pages) ---------- */
     const [resolved, closed] = await Promise.all([
-      searchTicketsPaged("status:4", 12),
-      searchTicketsPaged("status:5", 12),
+      searchTicketsPaged("status:4", 10),
+      searchTicketsPaged("status:5", 10),
     ]);
 
     const pooled = uniqById([...resolved, ...closed]);
@@ -143,7 +145,6 @@ app.get("/suggest", async (req, res) => {
       let overlap = 0;
       for (const w of candTokens) if (topWords.has(w)) overlap++;
 
-      // Boost if candidate contains the ticket subject phrase (helps short subjects)
       const subj = (ticket.subject || "").toLowerCase().trim();
       if (subj && candText.includes(subj)) overlap += 5;
 
@@ -163,7 +164,6 @@ app.get("/suggest", async (req, res) => {
         url: `${freshdeskDomain}/a/tickets/${s.id}`,
       }));
 
-    // If all scores are 0 but we have candidates, still return top 3 as "possible"
     const anyScore = ranked.some(t => t.score > 0);
     const similarTickets = anyScore ? ranked.filter(t => t.score > 0) : ranked.slice(0, 3);
 
@@ -171,7 +171,7 @@ app.get("/suggest", async (req, res) => {
       ticketId,
       subject: ticket.subject,
       similarTickets,
-      message: "Similar tickets MVP (paged status 4 + 5 pool) ✅",
+      message: "Similar tickets MVP (paged status 4 + 5 pool, page<=10) ✅",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

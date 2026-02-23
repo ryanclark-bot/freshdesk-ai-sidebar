@@ -66,17 +66,35 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
 
   for (let page = 1; page <= maxPages; page++) {
     const { data } = await fd.get(`/search/tickets`, {
-      params: { query, page }, // no per_page
+      params: { query, page },
     });
 
     const results = Array.isArray(data?.results) ? data.results : [];
     all.push(...results);
 
-    // stop early if we hit the end
     if (results.length === 0) break;
   }
 
   return all;
+}
+
+function tokenize(text) {
+  const stop = new Set([
+    "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
+    "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
+    "would","will","just","please","thanks","thank"
+  ]);
+
+  return String(text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter(w => w && w.length >= 3 && !stop.has(w));
+}
+
+function confidenceLabel(score) {
+  if (score >= 12) return "Likely";
+  if (score >= 6) return "Possible";
+  return "Low";
 }
 
 /* ---------------- ROUTES ---------------- */
@@ -99,31 +117,20 @@ app.get("/suggest", async (req, res) => {
       return res.json({ hide: true, reason: "Not Sales Help", group_id: ticket.group_id });
     }
 
-    /* ---------- 2) Build keyword set from current ticket ---------- */
-    const fullText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`
-      .toLowerCase();
+    const currentText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
+    const currentTokens = tokenize(currentText);
 
-    const stop = new Set([
-      "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
-      "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
-      "would","will","just","please","thanks","thank"
-    ]);
-
-    const tokens = fullText
-      .split(/[^a-z0-9]+/g)
-      .filter(w => w && w.length >= 3 && !stop.has(w));
-
+    // top words (frequency)
     const freq = new Map();
-    for (const w of tokens) freq.set(w, (freq.get(w) || 0) + 1);
-
+    for (const w of currentTokens) freq.set(w, (freq.get(w) || 0) + 1);
     const topWords = new Set(
       Array.from(freq.entries())
         .sort((a, b) => b[1] - a[1])
-        .slice(0, 30)
+        .slice(0, 35)
         .map(([w]) => w)
     );
 
-    /* ---------- 3) Candidate pool: resolved + closed (paged, max 10 pages) ---------- */
+    /* ---------- 2) Candidate pool: resolved + closed (paged, page<=10) ---------- */
     const [resolved, closed] = await Promise.all([
       searchTicketsPaged("status:4", 10),
       searchTicketsPaged("status:5", 10),
@@ -131,47 +138,74 @@ app.get("/suggest", async (req, res) => {
 
     const pooled = uniqById([...resolved, ...closed]);
 
-    /* ---------- 4) Filter to Sales Help + exclude current ticket ---------- */
     const candidates = pooled
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
-      .filter(t => String(t.id) !== ticketId)
-      .filter(t => (t.subject || "").trim().length > 0);
+      .filter(t => String(t.id) !== ticketId);
 
-    /* ---------- 5) Score similarity (subject overlap) ---------- */
-    function scoreTicket(t) {
-      const candText = `${t.subject || ""}`.toLowerCase();
-      const candTokens = candText.split(/[^a-z0-9]+/g).filter(Boolean);
+    /* ---------- 3) First-pass scoring (subject only) ---------- */
+    function scoreSubject(subject) {
+      const candTokens = tokenize(subject);
+      let overlap = 0;
+      for (const w of candTokens) if (topWords.has(w)) overlap++;
+      return overlap;
+    }
 
+    const firstPass = candidates
+      .map(t => ({
+        id: t.id,
+        subject: t.subject || "",
+        score1: scoreSubject(t.subject || ""),
+      }))
+      .sort((a, b) => b.score1 - a.score1)
+      .slice(0, 20); // take top 20 for deeper inspection
+
+    /* ---------- 4) Second-pass re-rank (fetch full ticket for better scoring) ---------- */
+    // Fetch full tickets in parallel (keep small to avoid rate limits)
+    const fullTickets = await Promise.all(
+      firstPass.map(async (t) => {
+        try {
+          const { data } = await fd.get(`/tickets/${t.id}`);
+          const txt = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
+          return { ...t, fullText: txt };
+        } catch (e) {
+          return { ...t, fullText: t.subject }; // fallback
+        }
+      })
+    );
+
+    function scoreFull(text) {
+      const candTokens = tokenize(text);
       let overlap = 0;
       for (const w of candTokens) if (topWords.has(w)) overlap++;
 
-      const subj = (ticket.subject || "").toLowerCase().trim();
-      if (subj && candText.includes(subj)) overlap += 5;
+      // boost if exact subject phrase appears
+      const subj = String(ticket.subject || "").toLowerCase().trim();
+      if (subj && String(text).toLowerCase().includes(subj)) overlap += 5;
 
       return overlap;
     }
 
-    const ranked = candidates
-      .map(t => ({
-        id: t.id,
-        subject: t.subject,
-        score: scoreTicket(t),
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5)
-      .map(s => ({
-        ...s,
-        url: `${freshdeskDomain}/a/tickets/${s.id}`,
-      }));
+    const ranked = fullTickets
+      .map(t => {
+        const score = scoreFull(t.fullText || t.subject);
+        return {
+          id: t.id,
+          subject: t.subject,
+          score,
+          confidence: confidenceLabel(score),
+          url: `${freshdeskDomain}/a/tickets/${t.id}`,
+        };
+      })
+      .sort((a, b) => b.score - a.score);
 
-    const anyScore = ranked.some(t => t.score > 0);
-    const similarTickets = anyScore ? ranked.filter(t => t.score > 0) : ranked.slice(0, 3);
+    // Always return top 3 (even if low), but keep max 5 if you want later
+    const similarTickets = ranked.slice(0, 3);
 
     return res.json({
       ticketId,
       subject: ticket.subject,
       similarTickets,
-      message: "Similar tickets MVP (paged status 4 + 5 pool, page<=10) ✅",
+      message: "Similar tickets MVP (paged pool + 2-pass rerank) ✅",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

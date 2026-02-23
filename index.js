@@ -54,25 +54,24 @@ function uniqById(tickets) {
 }
 
 /**
- * IMPORTANT for your Freshdesk: the query value must be wrapped in double quotes
- * Example that works for you: query="status:2"
- *
- * This version fetches multiple pages so we actually get enough Sales Help tickets.
+ * Your Freshdesk requires query wrapped in double quotes:
+ *   query="status:2"
+ * And it supports pagination via `page` but NOT `per_page`.
  */
-async function searchTicketsPaged(rawQuery, pages = 8, perPage = 30) {
+async function searchTicketsPaged(rawQuery, pages = 10) {
   const query = `"${rawQuery}"`;
   const all = [];
 
   for (let page = 1; page <= pages; page++) {
     const { data } = await fd.get(`/search/tickets`, {
-      params: { query, page, per_page: perPage },
+      params: { query, page }, // <-- no per_page
     });
 
     const results = Array.isArray(data?.results) ? data.results : [];
     all.push(...results);
 
-    // If this page returned less than perPage, we likely hit the end.
-    if (results.length < perPage) break;
+    // If an empty page is returned, we’ve hit the end.
+    if (results.length === 0) break;
   }
 
   return all;
@@ -124,8 +123,8 @@ app.get("/suggest", async (req, res) => {
 
     /* ---------- 3) Candidate pool: resolved + closed (paged) ---------- */
     const [resolved, closed] = await Promise.all([
-      searchTicketsPaged("status:4", 10, 30), // up to ~300
-      searchTicketsPaged("status:5", 10, 30), // up to ~300
+      searchTicketsPaged("status:4", 12),
+      searchTicketsPaged("status:5", 12),
     ]);
 
     const pooled = uniqById([...resolved, ...closed]);
@@ -136,7 +135,7 @@ app.get("/suggest", async (req, res) => {
       .filter(t => String(t.id) !== ticketId)
       .filter(t => (t.subject || "").trim().length > 0);
 
-    /* ---------- 5) Score similarity (subject overlap, but allow partials) ---------- */
+    /* ---------- 5) Score similarity (subject overlap) ---------- */
     function scoreTicket(t) {
       const candText = `${t.subject || ""}`.toLowerCase();
       const candTokens = candText.split(/[^a-z0-9]+/g).filter(Boolean);
@@ -144,21 +143,19 @@ app.get("/suggest", async (req, res) => {
       let overlap = 0;
       for (const w of candTokens) if (topWords.has(w)) overlap++;
 
-      // small boost if exact phrase from current subject appears
-      const subj = (ticket.subject || "").toLowerCase();
+      // Boost if candidate contains the ticket subject phrase (helps short subjects)
+      const subj = (ticket.subject || "").toLowerCase().trim();
       if (subj && candText.includes(subj)) overlap += 5;
 
       return overlap;
     }
 
-    const similarTickets = candidates
+    const ranked = candidates
       .map(t => ({
         id: t.id,
         subject: t.subject,
         score: scoreTicket(t),
       }))
-      // NOTE: for short tickets like "Acct merger", overlap may be 0
-      // so we allow >= 1, but we'll also show top items if candidates exist.
       .sort((a, b) => b.score - a.score)
       .slice(0, 5)
       .map(s => ({
@@ -167,13 +164,13 @@ app.get("/suggest", async (req, res) => {
       }));
 
     // If all scores are 0 but we have candidates, still return top 3 as "possible"
-    const anyScore = similarTickets.some(t => t.score > 0);
-    const finalSimilar = anyScore ? similarTickets.filter(t => t.score > 0) : similarTickets.slice(0, 3);
+    const anyScore = ranked.some(t => t.score > 0);
+    const similarTickets = anyScore ? ranked.filter(t => t.score > 0) : ranked.slice(0, 3);
 
     return res.json({
       ticketId,
       subject: ticket.subject,
-      similarTickets: finalSimilar,
+      similarTickets,
       message: "Similar tickets MVP (paged status 4 + 5 pool) ✅",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,

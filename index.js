@@ -60,12 +60,20 @@ function addContactHit(map, email, points, reason, ticketId) {
   if (!email) return;
   const key = String(email).toLowerCase();
   if (!map.has(key)) {
-    map.set(key, { email: key, score: 0, reasons: {}, tickets: new Set() });
+    map.set(key, {
+      email: key,
+      score: 0,
+      reasons: {},
+      tickets: new Set(),
+      flags: { sawTo: false, sawCc: false }
+    });
   }
   const obj = map.get(key);
   obj.score += points;
   obj.reasons[reason] = (obj.reasons[reason] || 0) + points;
   if (ticketId != null) obj.tickets.add(String(ticketId));
+  if (reason === "to_email") obj.flags.sawTo = true;
+  if (reason === "cc_email") obj.flags.sawCc = true;
 }
 
 /* ---------------- ENV ---------------- */
@@ -86,15 +94,12 @@ console.log("Has FRESHDESK_API_KEY:", Boolean(FRESHDESK_API_KEY));
 
 const fd = axios.create({
   baseURL,
-  auth: {
-    username: FRESHDESK_API_KEY,
-    password: "X",
-  },
+  auth: { username: FRESHDESK_API_KEY, password: "X" },
   timeout: 20000,
 });
 
 /**
- * Search quirks in your account:
+ * Your Freshdesk quirks:
  * - query must be wrapped in double quotes, e.g. query="status:2"
  * - page is allowed, but must be <= 10
  */
@@ -113,44 +118,6 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   return all;
 }
 
-/* ---------------- Sales Help agent email cache ---------------- */
-
-let salesHelpAgentEmailCache = {
-  fetchedAtMs: 0,
-  emails: new Set(),
-};
-
-// 15 minute cache
-const AGENT_CACHE_TTL_MS = 15 * 60 * 1000;
-
-async function getSalesHelpAgentEmails() {
-  const now = Date.now();
-  if (now - salesHelpAgentEmailCache.fetchedAtMs < AGENT_CACHE_TTL_MS && salesHelpAgentEmailCache.emails.size > 0) {
-    return salesHelpAgentEmailCache.emails;
-  }
-
-  // Pull agents and filter to those that belong to Sales Help group
-  // Many Freshdesk accounts include group_ids on agents; if yours doesn’t, we’ll adjust.
-  const { data: agents } = await fd.get(`/agents`);
-
-  const emails = new Set();
-  const list = Array.isArray(agents) ? agents : [];
-
-  for (const a of list) {
-    const agentEmail = String(a?.contact?.email || a?.email || "").toLowerCase();
-    const groupIds = Array.isArray(a?.group_ids) ? a.group_ids.map(String) : [];
-
-    if (agentEmail && groupIds.includes(SALES_HELP_GROUP_ID)) {
-      emails.add(agentEmail);
-    }
-  }
-
-  salesHelpAgentEmailCache = { fetchedAtMs: now, emails };
-  console.log("Sales Help agent emails cached:", emails.size);
-
-  return emails;
-}
-
 /* ---------------- ROUTES ---------------- */
 
 app.get("/health", (req, res) => res.send("ok"));
@@ -166,7 +133,6 @@ app.get("/suggest", async (req, res) => {
   try {
     /* ---------- A) Similar Tickets ---------- */
 
-    // 1) Read current ticket
     const { data: ticket } = await fd.get(`/tickets/${ticketId}`);
 
     if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
@@ -185,7 +151,6 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    // 2) Candidate pool: resolved + closed
     const [resolved, closed] = await Promise.all([
       searchTicketsPaged("status:4", 10),
       searchTicketsPaged("status:5", 10),
@@ -197,7 +162,6 @@ app.get("/suggest", async (req, res) => {
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
       .filter(t => String(t.id) !== ticketId);
 
-    // 3) First pass: subject overlap
     function scoreSubject(subject) {
       const candTokens = tokenize(subject);
       let overlap = 0;
@@ -210,7 +174,6 @@ app.get("/suggest", async (req, res) => {
       .sort((a, b) => b.score1 - a.score1)
       .slice(0, 20);
 
-    // 4) Second pass: fetch full ticket + re-score
     const fullTickets = await Promise.all(
       firstPass.map(async (t) => {
         try {
@@ -249,11 +212,12 @@ app.get("/suggest", async (req, res) => {
 
     const similarTickets = ranked.slice(0, 3);
 
-    /* ---------- B) Suggested External Contacts (0–2, only if strong, external = not Sales Help agent) ---------- */
-
-    const salesHelpAgentEmails = await getSalesHelpAgentEmails();
+    /* ---------- B) Suggested External Contacts (0–2, strong-only, external = not Sales Help group) ---------- */
+    // NOTE: Because your /agents response doesn’t give group membership cleanly, we define “external”
+    // pragmatically: emails that show up as TO/CC on similar tickets (i.e., someone you looped in).
 
     const contactScores = new Map();
+
     const topSimilarIds = similarTickets.map(t => t.id);
 
     const similarData = await Promise.all(
@@ -269,63 +233,78 @@ app.get("/suggest", async (req, res) => {
     for (const item of similarData) {
       const t = item.ticket;
 
-      // Strong signal: cc_emails
+      // Ticket-level CCs (strong loop-in signal)
       const cc = Array.isArray(t.cc_emails) ? t.cc_emails : [];
       for (const e of cc) {
         const email = String(e || "").toLowerCase();
-        if (email) addContactHit(contactScores, email, 4, "cc_email", item.id);
+        if (email) addContactHit(contactScores, email, 6, "cc_email", item.id);
       }
 
-      // Parse emails from conversation bodies
       const convs = Array.isArray(item.conversations) ? item.conversations : [];
       for (const conv of convs) {
-        const body = conv?.body_text || stripHtml(conv?.body || "");
-        const emails = extractEmailsFromText(body);
-        const incoming = conv?.incoming === true;
+        // BEST: use explicit email fields if present
+        const toList = Array.isArray(conv?.to_emails) ? conv.to_emails : [];
+        const ccList = Array.isArray(conv?.cc_emails) ? conv.cc_emails : [];
+        const bccList = Array.isArray(conv?.bcc_emails) ? conv.bcc_emails : [];
+        const fromEmail = conv?.from_email ? String(conv.from_email).toLowerCase() : "";
 
-        for (const email of emails) {
-          addContactHit(contactScores, email, incoming ? 3 : 1, incoming ? "inbound_body" : "body", item.id);
+        for (const e of toList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "to_email", item.id);
+        for (const e of ccList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "cc_email", item.id);
+        for (const e of bccList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "bcc_email", item.id);
+
+        // from_email can be useful when incoming (they replied)
+        const incoming = conv?.incoming === true;
+        if (fromEmail) addContactHit(contactScores, fromEmail, incoming ? 3 : 1, incoming ? "from_incoming" : "from_outgoing", item.id);
+
+        // fallback: parse body text
+        const body = conv?.body_text || stripHtml(conv?.body || "");
+        for (const email of extractEmailsFromText(body)) {
+          addContactHit(contactScores, email, incoming ? 2 : 1, incoming ? "inbound_body" : "body", item.id);
         }
       }
     }
 
-    // Filter out Sales Help agent emails (these are "internal" to the group)
-    const scored = Array.from(contactScores.values())
-      .filter(c => !salesHelpAgentEmails.has(c.email))
+    // Strong-only selection:
+    // - appears in 2+ similar tickets OR
+    // - was explicitly TO/CC/BCC on at least one similar ticket (loop-in signal) OR
+    // - score >= 8
+    const suggestedExternalContacts = Array.from(contactScores.values())
       .map(c => ({
         email: c.email,
         score: c.score,
         ticketCount: c.tickets.size,
+        sawTo: c.flags.sawTo,
+        sawCc: c.flags.sawCc,
         reasons: c.reasons,
       }))
-      // Strong-only:
-      // appears in >=2 similar tickets OR score >= 8
-      .filter(c => c.ticketCount >= 2 || c.score >= 8)
+      .filter(c => c.ticketCount >= 2 || c.sawTo || c.sawCc || c.score >= 8)
       .sort((a, b) => {
+        // prioritize loop-in signal, then multi-ticket, then score
+        const aLoop = (a.sawTo || a.sawCc) ? 1 : 0;
+        const bLoop = (b.sawTo || b.sawCc) ? 1 : 0;
+        if (bLoop !== aLoop) return bLoop - aLoop;
         if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
         return b.score - a.score;
       })
-      .slice(0, 2) // MAX 2
+      .slice(0, 2)
       .map(c => ({
         email: c.email,
         confidence:
+          (c.sawTo || c.sawCc) ? "High (explicitly looped in on similar ticket)" :
           c.ticketCount >= 2 ? "High (seen across multiple similar tickets)" :
           c.score >= 12 ? "High" :
           "Medium",
         evidence: { score: c.score, ticketCount: c.ticketCount, reasons: c.reasons },
       }));
 
-    const suggestedExternalContacts = scored; // could be []
-
     return res.json({
       ticketId,
       subject: ticket.subject,
       similarTickets,
       suggestedExternalContacts,
-      message: "A+B MVP ✅ (external = not Sales Help agent)",
+      message: "A+B MVP ✅ (external contacts = loop-in emails on similar tickets)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
-      salesHelpAgentEmailCount: salesHelpAgentEmails.size,
     });
 
   } catch (err) {

@@ -18,6 +18,10 @@ function buildBaseUrl(domain) {
   return `${domain}/api/v2`;
 }
 
+function stripHtml(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ");
+}
+
 const rawDomain = process.env.FRESHDESK_DOMAIN;
 const freshdeskDomain = sanitizeDomain(rawDomain);
 const baseURL = buildBaseUrl(freshdeskDomain);
@@ -40,10 +44,6 @@ const fd = axios.create({
   },
   timeout: 20000,
 });
-
-function stripHtml(s) {
-  return String(s || "").replace(/<[^>]*>/g, " ");
-}
 
 /* ---------------- ROUTES ---------------- */
 
@@ -90,16 +90,19 @@ app.get("/suggest", async (req, res) => {
     );
 
     /* ---------- 3) Pull a candidate pool (Resolved/Closed) ---------- */
-    // Freshdesk search can be picky about OR; parentheses make it valid more often.
-    const queryPrimary = "(status:4 OR status:5)";
+    // IMPORTANT: spaces inside parentheses so tokens are valid (status:4 not "(status:4")
+    const queryPrimary = "( status:4 OR status:5 )";
     const queryFallback = "status:4";
 
     let results = [];
+    let queryUsed = queryPrimary;
+
     try {
       const { data: search } = await fd.get(`/search/tickets`, { params: { query: queryPrimary } });
       results = Array.isArray(search?.results) ? search.results : [];
     } catch (e) {
       console.error("Search primary failed, falling back:", e.response?.status, e.response?.data || e.message);
+      queryUsed = queryFallback;
       const { data: search2 } = await fd.get(`/search/tickets`, { params: { query: queryFallback } });
       results = Array.isArray(search2?.results) ? search2.results : [];
     }
@@ -140,7 +143,9 @@ app.get("/suggest", async (req, res) => {
       subject: ticket.subject,
       similarTickets,
       message: "Similar tickets MVP (keyword overlap) ✅",
-      searchQueryUsed: results.length ? queryPrimary : queryFallback,
+      searchQueryUsed: queryUsed,
+      poolSize: results.length,
+      salesHelpCandidateCount: candidates.length,
     });
 
   } catch (err) {

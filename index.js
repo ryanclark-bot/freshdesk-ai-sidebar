@@ -25,6 +25,7 @@ const baseURL = buildBaseUrl(freshdeskDomain);
 const SALES_HELP_GROUP_ID = String(process.env.SALES_HELP_GROUP_ID || "").trim();
 const FRESHDESK_API_KEY = process.env.FRESHDESK_API_KEY;
 
+// Safe debug (does NOT print API key)
 console.log("FRESHDESK_DOMAIN raw:", JSON.stringify(rawDomain));
 console.log("FRESHDESK_DOMAIN sanitized:", JSON.stringify(freshdeskDomain));
 console.log("Freshdesk baseURL:", JSON.stringify(baseURL));
@@ -40,6 +41,10 @@ const fd = axios.create({
   timeout: 20000,
 });
 
+function stripHtml(s) {
+  return String(s || "").replace(/<[^>]*>/g, " ");
+}
+
 /* ---------------- ROUTES ---------------- */
 
 app.get("/health", (req, res) => res.send("ok"));
@@ -53,16 +58,15 @@ app.get("/suggest", async (req, res) => {
   if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
 
   try {
-    /* ---------- 1. Read current ticket ---------- */
+    /* ---------- 1) Read current ticket ---------- */
     const { data: ticket } = await fd.get(`/tickets/${ticketId}`);
 
     if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
       return res.json({ hide: true, reason: "Not Sales Help", group_id: ticket.group_id });
     }
 
-    /* ---------- 2. Build keyword set ---------- */
-    const text = `${ticket.subject || ""}\n${ticket.description_text || ticket.description || ""}`
-      .replace(/<[^>]*>/g, " ")
+    /* ---------- 2) Build keyword set from current ticket ---------- */
+    const fullText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`
       .toLowerCase();
 
     const stop = new Set([
@@ -71,7 +75,7 @@ app.get("/suggest", async (req, res) => {
       "would","will","just","please","thanks","thank"
     ]);
 
-    const tokens = text
+    const tokens = fullText
       .split(/[^a-z0-9]+/g)
       .filter(w => w && w.length >= 3 && !stop.has(w));
 
@@ -85,26 +89,34 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    /* ---------- 3. Pull resolved/closed pool ---------- */
-    const { data: search } = await fd.get(`/search/tickets`, {
-      params: { query: "status:4 OR status:5" },
-    });
+    /* ---------- 3) Pull a candidate pool (Resolved/Closed) ---------- */
+    // Freshdesk search can be picky about OR; parentheses make it valid more often.
+    const queryPrimary = "(status:4 OR status:5)";
+    const queryFallback = "status:4";
 
-    const results = Array.isArray(search?.results) ? search.results : [];
+    let results = [];
+    try {
+      const { data: search } = await fd.get(`/search/tickets`, { params: { query: queryPrimary } });
+      results = Array.isArray(search?.results) ? search.results : [];
+    } catch (e) {
+      console.error("Search primary failed, falling back:", e.response?.status, e.response?.data || e.message);
+      const { data: search2 } = await fd.get(`/search/tickets`, { params: { query: queryFallback } });
+      results = Array.isArray(search2?.results) ? search2.results : [];
+    }
 
+    /* ---------- 4) Filter to Sales Help + exclude current ticket ---------- */
     const candidates = results
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
       .filter(t => String(t.id) !== ticketId)
       .filter(t => (t.subject || "").trim().length > 0);
 
-    /* ---------- 4. Score similarity ---------- */
+    /* ---------- 5) Score similarity (subject overlap) ---------- */
     function scoreTicket(t) {
       const candText = `${t.subject || ""}`.toLowerCase();
       const candTokens = candText.split(/[^a-z0-9]+/g).filter(Boolean);
 
       let overlap = 0;
       for (const w of candTokens) if (topWords.has(w)) overlap++;
-
       return overlap;
     }
 
@@ -122,12 +134,13 @@ app.get("/suggest", async (req, res) => {
         url: `${freshdeskDomain}/a/tickets/${s.id}`,
       }));
 
-    /* ---------- 5. Return ---------- */
+    /* ---------- 6) Return ---------- */
     return res.json({
       ticketId,
       subject: ticket.subject,
       similarTickets,
       message: "Similar tickets MVP (keyword overlap) ✅",
+      searchQueryUsed: results.length ? queryPrimary : queryFallback,
     });
 
   } catch (err) {
@@ -136,7 +149,12 @@ app.get("/suggest", async (req, res) => {
       console.error("Freshdesk status:", err.response.status);
       console.error("Freshdesk data:", err.response.data);
     }
-    return res.status(500).send("Error");
+    const status = err.response?.status || 500;
+    return res.status(status).json({
+      error: err.message,
+      freshdeskStatus: err.response?.status || null,
+      freshdeskData: err.response?.data || null,
+    });
   }
 });
 

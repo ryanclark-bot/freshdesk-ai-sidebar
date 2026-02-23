@@ -45,6 +45,19 @@ const fd = axios.create({
   timeout: 20000,
 });
 
+async function searchTickets(query) {
+  const { data } = await fd.get(`/search/tickets`, { params: { query } });
+  return Array.isArray(data?.results) ? data.results : [];
+}
+
+function uniqById(tickets) {
+  const m = new Map();
+  for (const t of tickets) {
+    if (t && t.id != null) m.set(String(t.id), t);
+  }
+  return Array.from(m.values());
+}
+
 /* ---------------- ROUTES ---------------- */
 
 app.get("/health", (req, res) => res.send("ok"));
@@ -89,26 +102,16 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    /* ---------- 3) Pull a candidate pool (Resolved/Closed) ---------- */
-    // IMPORTANT: spaces inside parentheses so tokens are valid (status:4 not "(status:4")
-    const queryPrimary = "( status:4 OR status:5 )";
-    const queryFallback = "status:4";
+    /* ---------- 3) Candidate pool: DO NOT use OR (your account rejects it) ---------- */
+    const [resolved, closed] = await Promise.all([
+      searchTickets("status:4"),
+      searchTickets("status:5"),
+    ]);
 
-    let results = [];
-    let queryUsed = queryPrimary;
-
-    try {
-      const { data: search } = await fd.get(`/search/tickets`, { params: { query: queryPrimary } });
-      results = Array.isArray(search?.results) ? search.results : [];
-    } catch (e) {
-      console.error("Search primary failed, falling back:", e.response?.status, e.response?.data || e.message);
-      queryUsed = queryFallback;
-      const { data: search2 } = await fd.get(`/search/tickets`, { params: { query: queryFallback } });
-      results = Array.isArray(search2?.results) ? search2.results : [];
-    }
+    const pooled = uniqById([...resolved, ...closed]);
 
     /* ---------- 4) Filter to Sales Help + exclude current ticket ---------- */
-    const candidates = results
+    const candidates = pooled
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
       .filter(t => String(t.id) !== ticketId)
       .filter(t => (t.subject || "").trim().length > 0);
@@ -137,14 +140,12 @@ app.get("/suggest", async (req, res) => {
         url: `${freshdeskDomain}/a/tickets/${s.id}`,
       }));
 
-    /* ---------- 6) Return ---------- */
     return res.json({
       ticketId,
       subject: ticket.subject,
       similarTickets,
-      message: "Similar tickets MVP (keyword overlap) ✅",
-      searchQueryUsed: queryUsed,
-      poolSize: results.length,
+      message: "Similar tickets MVP (2-pass search: resolved + closed) ✅",
+      poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });
 

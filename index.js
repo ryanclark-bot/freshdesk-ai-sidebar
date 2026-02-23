@@ -22,6 +22,54 @@ function stripHtml(s) {
   return String(s || "").replace(/<[^>]*>/g, " ");
 }
 
+function uniqById(tickets) {
+  const m = new Map();
+  for (const t of tickets) {
+    if (t && t.id != null) m.set(String(t.id), t);
+  }
+  return Array.from(m.values());
+}
+
+function tokenize(text) {
+  const stop = new Set([
+    "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
+    "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
+    "would","will","just","please","thanks","thank"
+  ]);
+
+  return String(text || "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/g)
+    .filter(w => w && w.length >= 3 && !stop.has(w));
+}
+
+function confidenceLabel(score) {
+  if (score >= 12) return "Likely";
+  if (score >= 6) return "Possible";
+  return "Low";
+}
+
+function extractEmailsFromText(text) {
+  const s = String(text || "");
+  const re = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  const matches = s.match(re) || [];
+  return matches.map(e => e.toLowerCase());
+}
+
+function addContactHit(map, email, points, reason, ticketId) {
+  if (!email) return;
+  const key = String(email).toLowerCase();
+  if (!map.has(key)) {
+    map.set(key, { email: key, score: 0, reasons: {}, tickets: new Set() });
+  }
+  const obj = map.get(key);
+  obj.score += points;
+  obj.reasons[reason] = (obj.reasons[reason] || 0) + points;
+  if (ticketId != null) obj.tickets.add(String(ticketId));
+}
+
+/* ---------------- ENV ---------------- */
+
 const rawDomain = process.env.FRESHDESK_DOMAIN;
 const freshdeskDomain = sanitizeDomain(rawDomain);
 const baseURL = buildBaseUrl(freshdeskDomain);
@@ -45,14 +93,6 @@ const fd = axios.create({
   timeout: 20000,
 });
 
-function uniqById(tickets) {
-  const m = new Map();
-  for (const t of tickets) {
-    if (t && t.id != null) m.set(String(t.id), t);
-  }
-  return Array.from(m.values());
-}
-
 /**
  * Your Freshdesk requires query wrapped in double quotes:
  *   query="status:2"
@@ -65,36 +105,13 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   const maxPages = Math.min(Math.max(1, Number(maxPagesRequested) || 1), 10);
 
   for (let page = 1; page <= maxPages; page++) {
-    const { data } = await fd.get(`/search/tickets`, {
-      params: { query, page },
-    });
-
+    const { data } = await fd.get(`/search/tickets`, { params: { query, page } });
     const results = Array.isArray(data?.results) ? data.results : [];
     all.push(...results);
-
     if (results.length === 0) break;
   }
 
   return all;
-}
-
-function tokenize(text) {
-  const stop = new Set([
-    "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
-    "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
-    "would","will","just","please","thanks","thank"
-  ]);
-
-  return String(text || "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/g)
-    .filter(w => w && w.length >= 3 && !stop.has(w));
-}
-
-function confidenceLabel(score) {
-  if (score >= 12) return "Likely";
-  if (score >= 6) return "Possible";
-  return "Low";
 }
 
 /* ---------------- ROUTES ---------------- */
@@ -110,7 +127,9 @@ app.get("/suggest", async (req, res) => {
   if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
 
   try {
-    /* ---------- 1) Read current ticket ---------- */
+    /* ---------- A) Similar Tickets ---------- */
+
+    // 1) Read current ticket
     const { data: ticket } = await fd.get(`/tickets/${ticketId}`);
 
     if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
@@ -120,7 +139,6 @@ app.get("/suggest", async (req, res) => {
     const currentText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
     const currentTokens = tokenize(currentText);
 
-    // top words (frequency)
     const freq = new Map();
     for (const w of currentTokens) freq.set(w, (freq.get(w) || 0) + 1);
     const topWords = new Set(
@@ -130,7 +148,7 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    /* ---------- 2) Candidate pool: resolved + closed (paged, page<=10) ---------- */
+    // 2) Candidate pool: resolved + closed (paged)
     const [resolved, closed] = await Promise.all([
       searchTicketsPaged("status:4", 10),
       searchTicketsPaged("status:5", 10),
@@ -142,7 +160,7 @@ app.get("/suggest", async (req, res) => {
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
       .filter(t => String(t.id) !== ticketId);
 
-    /* ---------- 3) First-pass scoring (subject only) ---------- */
+    // 3) First pass: subject overlap
     function scoreSubject(subject) {
       const candTokens = tokenize(subject);
       let overlap = 0;
@@ -151,24 +169,19 @@ app.get("/suggest", async (req, res) => {
     }
 
     const firstPass = candidates
-      .map(t => ({
-        id: t.id,
-        subject: t.subject || "",
-        score1: scoreSubject(t.subject || ""),
-      }))
+      .map(t => ({ id: t.id, subject: t.subject || "", score1: scoreSubject(t.subject || "") }))
       .sort((a, b) => b.score1 - a.score1)
-      .slice(0, 20); // take top 20 for deeper inspection
+      .slice(0, 20);
 
-    /* ---------- 4) Second-pass re-rank (fetch full ticket for better scoring) ---------- */
-    // Fetch full tickets in parallel (keep small to avoid rate limits)
+    // 4) Second pass: fetch full ticket + re-score
     const fullTickets = await Promise.all(
       firstPass.map(async (t) => {
         try {
           const { data } = await fd.get(`/tickets/${t.id}`);
           const txt = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
           return { ...t, fullText: txt };
-        } catch (e) {
-          return { ...t, fullText: t.subject }; // fallback
+        } catch {
+          return { ...t, fullText: t.subject };
         }
       })
     );
@@ -178,7 +191,6 @@ app.get("/suggest", async (req, res) => {
       let overlap = 0;
       for (const w of candTokens) if (topWords.has(w)) overlap++;
 
-      // boost if exact subject phrase appears
       const subj = String(ticket.subject || "").toLowerCase().trim();
       if (subj && String(text).toLowerCase().includes(subj)) overlap += 5;
 
@@ -198,14 +210,86 @@ app.get("/suggest", async (req, res) => {
       })
       .sort((a, b) => b.score - a.score);
 
-    // Always return top 3 (even if low), but keep max 5 if you want later
     const similarTickets = ranked.slice(0, 3);
+
+    /* ---------- B) Suggested External Contacts (0–2, only if strong) ---------- */
+
+    const contactScores = new Map();
+
+    // Only look at top similar tickets to keep API calls low
+    const topSimilarIds = similarTickets.map(t => t.id);
+
+    const similarData = await Promise.all(
+      topSimilarIds.map(async (id) => {
+        const [tRes, cRes] = await Promise.all([
+          fd.get(`/tickets/${id}`),
+          fd.get(`/tickets/${id}/conversations`),
+        ]);
+        return { ticket: tRes.data, conversations: cRes.data, id };
+      })
+    );
+
+    for (const item of similarData) {
+      const t = item.ticket;
+
+      // 1) cc_emails are strong signals (explicitly involved)
+      const cc = Array.isArray(t.cc_emails) ? t.cc_emails : [];
+      for (const e of cc) {
+        const email = String(e || "").toLowerCase();
+        if (email) addContactHit(contactScores, email, 4, "cc_email", item.id);
+      }
+
+      // 2) Pull emails from conversation bodies (inbound/outbound)
+      const convs = Array.isArray(item.conversations) ? item.conversations : [];
+      for (const conv of convs) {
+        const body = conv?.body_text || stripHtml(conv?.body || "");
+        const emails = extractEmailsFromText(body);
+
+        // Inbound tends to be stronger “they replied” signal
+        const incoming = conv?.incoming === true;
+
+        for (const email of emails) {
+          addContactHit(contactScores, email, incoming ? 3 : 1, incoming ? "inbound_body" : "body", item.id);
+        }
+      }
+    }
+
+    // Convert to list + compute strong confidence
+    const contacts = Array.from(contactScores.values())
+      .map(c => ({
+        email: c.email,
+        score: c.score,
+        ticketCount: c.tickets.size,
+        reasons: c.reasons,
+      }))
+      // Strong-only filter:
+      // - appears in >=2 similar tickets OR score >= 8
+      .filter(c => c.ticketCount >= 2 || c.score >= 8)
+      .sort((a, b) => {
+        // prioritize multi-ticket appearances, then score
+        if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
+        return b.score - a.score;
+      })
+      .slice(0, 2) // MAX 2 contacts (per your requirement)
+      .map(c => ({
+        email: c.email,
+        confidence:
+          c.ticketCount >= 2 ? "High (seen on multiple similar tickets)" :
+          c.score >= 12 ? "High" :
+          "Medium",
+        // Keep this evidence for now; we can hide it in production
+        evidence: { score: c.score, ticketCount: c.ticketCount, reasons: c.reasons },
+      }));
+
+    // If none qualify, return []
+    const suggestedExternalContacts = contacts;
 
     return res.json({
       ticketId,
       subject: ticket.subject,
       similarTickets,
-      message: "Similar tickets MVP (paged pool + 2-pass rerank) ✅",
+      suggestedExternalContacts,
+      message: "A+B MVP ✅ (Similar tickets + external contacts if applicable)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

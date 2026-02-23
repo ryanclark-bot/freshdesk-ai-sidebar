@@ -77,7 +77,7 @@ const baseURL = buildBaseUrl(freshdeskDomain);
 const SALES_HELP_GROUP_ID = String(process.env.SALES_HELP_GROUP_ID || "").trim();
 const FRESHDESK_API_KEY = process.env.FRESHDESK_API_KEY;
 
-// Safe debug (does NOT print API key)
+// Safe debug
 console.log("FRESHDESK_DOMAIN raw:", JSON.stringify(rawDomain));
 console.log("FRESHDESK_DOMAIN sanitized:", JSON.stringify(freshdeskDomain));
 console.log("Freshdesk baseURL:", JSON.stringify(baseURL));
@@ -94,14 +94,13 @@ const fd = axios.create({
 });
 
 /**
- * Your Freshdesk requires query wrapped in double quotes:
- *   query="status:2"
- * It supports pagination via `page`, but page MUST be <= 10.
+ * Search quirks in your account:
+ * - query must be wrapped in double quotes, e.g. query="status:2"
+ * - page is allowed, but must be <= 10
  */
 async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   const query = `"${rawQuery}"`;
   const all = [];
-
   const maxPages = Math.min(Math.max(1, Number(maxPagesRequested) || 1), 10);
 
   for (let page = 1; page <= maxPages; page++) {
@@ -112,6 +111,44 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   }
 
   return all;
+}
+
+/* ---------------- Sales Help agent email cache ---------------- */
+
+let salesHelpAgentEmailCache = {
+  fetchedAtMs: 0,
+  emails: new Set(),
+};
+
+// 15 minute cache
+const AGENT_CACHE_TTL_MS = 15 * 60 * 1000;
+
+async function getSalesHelpAgentEmails() {
+  const now = Date.now();
+  if (now - salesHelpAgentEmailCache.fetchedAtMs < AGENT_CACHE_TTL_MS && salesHelpAgentEmailCache.emails.size > 0) {
+    return salesHelpAgentEmailCache.emails;
+  }
+
+  // Pull agents and filter to those that belong to Sales Help group
+  // Many Freshdesk accounts include group_ids on agents; if yours doesn’t, we’ll adjust.
+  const { data: agents } = await fd.get(`/agents`);
+
+  const emails = new Set();
+  const list = Array.isArray(agents) ? agents : [];
+
+  for (const a of list) {
+    const agentEmail = String(a?.contact?.email || a?.email || "").toLowerCase();
+    const groupIds = Array.isArray(a?.group_ids) ? a.group_ids.map(String) : [];
+
+    if (agentEmail && groupIds.includes(SALES_HELP_GROUP_ID)) {
+      emails.add(agentEmail);
+    }
+  }
+
+  salesHelpAgentEmailCache = { fetchedAtMs: now, emails };
+  console.log("Sales Help agent emails cached:", emails.size);
+
+  return emails;
 }
 
 /* ---------------- ROUTES ---------------- */
@@ -148,7 +185,7 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    // 2) Candidate pool: resolved + closed (paged)
+    // 2) Candidate pool: resolved + closed
     const [resolved, closed] = await Promise.all([
       searchTicketsPaged("status:4", 10),
       searchTicketsPaged("status:5", 10),
@@ -212,11 +249,11 @@ app.get("/suggest", async (req, res) => {
 
     const similarTickets = ranked.slice(0, 3);
 
-    /* ---------- B) Suggested External Contacts (0–2, only if strong) ---------- */
+    /* ---------- B) Suggested External Contacts (0–2, only if strong, external = not Sales Help agent) ---------- */
+
+    const salesHelpAgentEmails = await getSalesHelpAgentEmails();
 
     const contactScores = new Map();
-
-    // Only look at top similar tickets to keep API calls low
     const topSimilarIds = similarTickets.map(t => t.id);
 
     const similarData = await Promise.all(
@@ -232,20 +269,18 @@ app.get("/suggest", async (req, res) => {
     for (const item of similarData) {
       const t = item.ticket;
 
-      // 1) cc_emails are strong signals (explicitly involved)
+      // Strong signal: cc_emails
       const cc = Array.isArray(t.cc_emails) ? t.cc_emails : [];
       for (const e of cc) {
         const email = String(e || "").toLowerCase();
         if (email) addContactHit(contactScores, email, 4, "cc_email", item.id);
       }
 
-      // 2) Pull emails from conversation bodies (inbound/outbound)
+      // Parse emails from conversation bodies
       const convs = Array.isArray(item.conversations) ? item.conversations : [];
       for (const conv of convs) {
         const body = conv?.body_text || stripHtml(conv?.body || "");
         const emails = extractEmailsFromText(body);
-
-        // Inbound tends to be stronger “they replied” signal
         const incoming = conv?.incoming === true;
 
         for (const email of emails) {
@@ -254,44 +289,43 @@ app.get("/suggest", async (req, res) => {
       }
     }
 
-    // Convert to list + compute strong confidence
-    const contacts = Array.from(contactScores.values())
+    // Filter out Sales Help agent emails (these are "internal" to the group)
+    const scored = Array.from(contactScores.values())
+      .filter(c => !salesHelpAgentEmails.has(c.email))
       .map(c => ({
         email: c.email,
         score: c.score,
         ticketCount: c.tickets.size,
         reasons: c.reasons,
       }))
-      // Strong-only filter:
-      // - appears in >=2 similar tickets OR score >= 8
+      // Strong-only:
+      // appears in >=2 similar tickets OR score >= 8
       .filter(c => c.ticketCount >= 2 || c.score >= 8)
       .sort((a, b) => {
-        // prioritize multi-ticket appearances, then score
         if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
         return b.score - a.score;
       })
-      .slice(0, 2) // MAX 2 contacts (per your requirement)
+      .slice(0, 2) // MAX 2
       .map(c => ({
         email: c.email,
         confidence:
-          c.ticketCount >= 2 ? "High (seen on multiple similar tickets)" :
+          c.ticketCount >= 2 ? "High (seen across multiple similar tickets)" :
           c.score >= 12 ? "High" :
           "Medium",
-        // Keep this evidence for now; we can hide it in production
         evidence: { score: c.score, ticketCount: c.ticketCount, reasons: c.reasons },
       }));
 
-    // If none qualify, return []
-    const suggestedExternalContacts = contacts;
+    const suggestedExternalContacts = scored; // could be []
 
     return res.json({
       ticketId,
       subject: ticket.subject,
       similarTickets,
       suggestedExternalContacts,
-      message: "A+B MVP ✅ (Similar tickets + external contacts if applicable)",
+      message: "A+B MVP ✅ (external = not Sales Help agent)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
+      salesHelpAgentEmailCount: salesHelpAgentEmails.size,
     });
 
   } catch (err) {

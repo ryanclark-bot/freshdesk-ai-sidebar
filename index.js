@@ -45,17 +45,24 @@ const fd = axios.create({
   timeout: 20000,
 });
 
-async function searchTickets(query) {
-  const { data } = await fd.get(`/search/tickets`, { params: { query } });
-  return Array.isArray(data?.results) ? data.results : [];
-}
-
 function uniqById(tickets) {
   const m = new Map();
   for (const t of tickets) {
     if (t && t.id != null) m.set(String(t.id), t);
   }
   return Array.from(m.values());
+}
+
+/**
+ * IMPORTANT for your Freshdesk: the query value must be wrapped in double quotes
+ * Example that works for you: query="status:2"
+ */
+async function searchTickets(rawQuery) {
+  const query = `"${rawQuery}"`; // <-- key fix
+  console.log("Freshdesk search query:", query);
+
+  const { data } = await fd.get(`/search/tickets`, { params: { query } });
+  return Array.isArray(data?.results) ? data.results : [];
 }
 
 /* ---------------- ROUTES ---------------- */
@@ -102,7 +109,7 @@ app.get("/suggest", async (req, res) => {
         .map(([w]) => w)
     );
 
-    /* ---------- 3) Candidate pool: DO NOT use OR (your account rejects it) ---------- */
+    /* ---------- 3) Candidate pool: resolved + closed (two searches, no OR) ---------- */
     const [resolved, closed] = await Promise.all([
       searchTickets("status:4"),
       searchTickets("status:5"),
@@ -144,7 +151,7 @@ app.get("/suggest", async (req, res) => {
       ticketId,
       subject: ticket.subject,
       similarTickets,
-      message: "Similar tickets MVP (2-pass search: resolved + closed) ✅",
+      message: "Similar tickets MVP (status 4 + 5 searches, quoted queries) ✅",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

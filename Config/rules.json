@@ -2,6 +2,17 @@
   "max_suggested_contacts": 2,
   "rules": [
     {
+      "id": "growth_advisor_csx",
+      "suggest": [],
+      "anyOf": [
+        { "any": ["growth advisor"] },
+        { "any": ["csx.scorpion.co"] },
+        { "any": ["/client/tools/deals"] },
+        { "all": ["csx", "deals"] }
+      ],
+      "notAny": []
+    },
+    {
       "id": "servicedesk_zoom_signature",
       "suggest": [
         { "email": "servicedesk@scorpion.co", "label": "Service Desk" }

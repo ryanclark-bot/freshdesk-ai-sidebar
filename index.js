@@ -2,72 +2,51 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(cors());
 
 /* =========================
-   CONFIG (easy to edit)
+   LOAD CONFIG FILES
    ========================= */
 
-// Exclude list (your team) - never suggest these
-const EXCLUDED_EMAILS = new Set([
-  "tera.lockwood@scorpion.co",
-  "amanda.wilcock@scorpion.co",
-  "luke.starmer@scorpion.co",
-  "shaniqua.capote@scorpion.co",
-  "gabriella.morris@scorpion.co",
-  "ryan.clark@scorpion.co",
-  "treska.mitchell@scorpion.co",
-].map(e => String(e).toLowerCase()));
+function readJson(filePath) {
+  const abs = path.join(__dirname, filePath);
+  const raw = fs.readFileSync(abs, "utf8");
+  return JSON.parse(raw);
+}
 
-// Optional: exclude your group distro if it appears
-const SALES_HELP_INBOX = "saleshelp@scorpion.co";
+// Defaults (in case config files are missing/malformed)
+let RULES_CONFIG = { max_suggested_contacts: 2, rules: [] };
+let EXCLUSIONS_CONFIG = {
+  excluded_emails: [],
+  excluded_inboxes: ["saleshelp@scorpion.co"],
+  system_email_prefixes: ["freshdesk", "no-reply", "noreply", "notification", "notifications"],
+};
 
-// System/automation addresses to never suggest
-const SYSTEM_EMAIL_PATTERNS = [
-  /^freshdesk/i,
-  /^no-?reply/i,
-  /^notifications?/i,
-];
+try {
+  RULES_CONFIG = readJson("config/rules.json");
+  console.log("Loaded config/rules.json");
+} catch (e) {
+  console.log("WARNING: Could not load config/rules.json; using defaults:", e.message);
+}
 
-// Keyword rules (v1 testing)
-// Matching is token/phrase-based, order-independent for "all" groups.
-const KEYWORD_RULES = [
-  {
-    id: "servicedesk_zoom_signature",
-    suggest: [{ email: "servicedesk@scorpion.co", label: "Service Desk" }],
-    // Match if ANY of these groups match:
-    // 1) any: zoom
-    // 2) all: signature + phone
-    // 3) all: signature + email
-    anyOf: [
-      { any: ["zoom"] },
-      { all: ["signature", "phone"] },
-      { all: ["signature", "email"] },
-    ],
-    notAny: [], // optional global block list
-  },
-  {
-    id: "reputation_suite",
-    suggest: [{ email: "julie.kennedy@scorpion.co", label: "Reputation Suite" }],
-    anyOf: [{ any: ["reputation suite"] }],
-    notAny: [],
-  },
-  {
-    id: "convert",
-    suggest: [{ email: "mandy.bennet@scorpion.co", label: "Convert" }],
-    anyOf: [{ any: ["convert", "scorpion convert"] }],
-    // Only block if it says "lead convert"
-    notAny: ["lead convert"],
-  },
-];
+try {
+  EXCLUSIONS_CONFIG = readJson("config/excluded_emails.json");
+  console.log("Loaded config/excluded_emails.json");
+} catch (e) {
+  console.log("WARNING: Could not load config/excluded_emails.json; using defaults:", e.message);
+}
 
-// Max contacts overall (rule-based + history/current-loopin combined)
-const MAX_SUGGESTED_CONTACTS = 2;
+const MAX_SUGGESTED_CONTACTS = Math.max(
+  1,
+  Number(RULES_CONFIG?.max_suggested_contacts || 2)
+);
 
 /* =========================
-   Helpers
+   HELPERS
    ========================= */
 
 function sanitizeDomain(raw) {
@@ -86,6 +65,7 @@ function uniqById(tickets) {
   for (const t of tickets) if (t && t.id != null) m.set(String(t.id), t);
   return Array.from(m.values());
 }
+
 function tokenize(text) {
   const stop = new Set([
     "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
@@ -95,74 +75,71 @@ function tokenize(text) {
   return String(text || "")
     .toLowerCase()
     .split(/[^a-z0-9]+/g)
-    .filter(w => w && w.length >= 2 && !stop.has(w)); // keep 2+ chars to catch "id", etc.
+    .filter(w => w && w.length >= 2 && !stop.has(w));
 }
+
 function confidenceLabel(score) {
   if (score >= 12) return "Likely";
   if (score >= 6) return "Possible";
   return "Low";
 }
+
 function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
+
+/* =========================
+   EXCLUSIONS (from JSON)
+   ========================= */
+
+const EXCLUDED_EMAILS = new Set(
+  (EXCLUSIONS_CONFIG?.excluded_emails || []).map(normalizeEmail)
+);
+
+const EXCLUDED_INBOXES = new Set(
+  (EXCLUSIONS_CONFIG?.excluded_inboxes || []).map(normalizeEmail)
+);
+
+const SYSTEM_PREFIXES = (EXCLUSIONS_CONFIG?.system_email_prefixes || [])
+  .map(p => String(p || "").toLowerCase())
+  .filter(Boolean);
+
 function isSystemEmail(email) {
   const e = normalizeEmail(email);
-  return SYSTEM_EMAIL_PATTERNS.some(re => re.test(e));
+  return SYSTEM_PREFIXES.some(prefix => e.startsWith(prefix));
 }
+
 function isExcluded(email) {
   const e = normalizeEmail(email);
-  return EXCLUDED_EMAILS.has(e) || e === normalizeEmail(SALES_HELP_INBOX) || isSystemEmail(e);
+  return EXCLUDED_EMAILS.has(e) || EXCLUDED_INBOXES.has(e) || isSystemEmail(e);
 }
+
 function isValidCandidateEmail(email, requesterEmail) {
   const e = normalizeEmail(email);
   const r = normalizeEmail(requesterEmail);
+
   if (!e) return false;
   if (isExcluded(e)) return false;
   if (r && e === r) return false; // exclude requester/customer
   return true;
 }
 
-function addContactHit(map, email, points, reason, ticketId) {
-  const e = normalizeEmail(email);
-  if (!e) return;
-  if (!map.has(e)) {
-    map.set(e, { email: e, score: 0, reasons: {}, tickets: new Set(), sawCurrent: false });
-  }
-  const obj = map.get(e);
-  obj.score += points;
-  obj.reasons[reason] = (obj.reasons[reason] || 0) + points;
-  if (ticketId != null) obj.tickets.add(String(ticketId));
-  if (reason.startsWith("current_") || reason.startsWith("rule_")) obj.sawCurrent = true;
-}
-
 /* =========================
-   Rule Matching (order-independent)
+   RULE MATCHING (order-independent)
    ========================= */
 
-/**
- * We want:
- * - "all": every item must appear somewhere (token or phrase)
- * - "any": at least one item appears
- * - "notAny": none of these items appear
- *
- * Items can be single words ("signature") or phrases ("reputation suite").
- */
-function textHasPhrase(textLower, phraseLower) {
-  return textLower.includes(phraseLower);
-}
-
 function buildTokenSet(tokens) {
-  return new Set(tokens.map(t => String(t).toLowerCase()));
+  return new Set((tokens || []).map(t => String(t).toLowerCase()));
 }
 
 function itemMatches(textLower, tokenSet, item) {
   const p = String(item || "").toLowerCase().trim();
   if (!p) return false;
 
-  // If phrase contains space, do substring match
-  if (p.includes(" ")) return textHasPhrase(textLower, p);
+  // phrase match
+  if (p.includes(" ")) return textLower.includes(p);
 
-  // Otherwise token match
+  // token match
   return tokenSet.has(p);
 }
 
@@ -171,64 +148,54 @@ function groupMatches(textLower, tokenSet, group) {
   const allList = Array.isArray(group?.all) ? group.all : [];
 
   if (allList.length > 0) {
-    for (const it of allList) {
-      if (!itemMatches(textLower, tokenSet, it)) return false;
-    }
-    return true;
+    return allList.every(it => itemMatches(textLower, tokenSet, it));
   }
-
   if (anyList.length > 0) {
-    for (const it of anyList) {
-      if (itemMatches(textLower, tokenSet, it)) return true;
-    }
-    return false;
+    return anyList.some(it => itemMatches(textLower, tokenSet, it));
   }
-
   return false;
 }
 
 function ruleMatches(rule, textLower, tokenSet) {
-  // Global blocks
   const notAny = Array.isArray(rule?.notAny) ? rule.notAny : [];
   for (const it of notAny) {
     if (itemMatches(textLower, tokenSet, it)) return false;
   }
 
-  // anyOf groups
   const anyOf = Array.isArray(rule?.anyOf) ? rule.anyOf : [];
   if (anyOf.length === 0) return false;
 
   return anyOf.some(group => groupMatches(textLower, tokenSet, group));
 }
 
-function buildRuleSuggestions(ticketText) {
-  const textLower = String(ticketText || "").toLowerCase();
-  const tokenSet = buildTokenSet(tokenize(textLower));
+function buildRuleSuggestions(ticketTextLower, requesterEmail) {
+  const tokenSet = buildTokenSet(tokenize(ticketTextLower));
 
   const suggestions = [];
-  for (const rule of KEYWORD_RULES) {
-    if (!ruleMatches(rule, textLower, tokenSet)) continue;
+  for (const rule of (RULES_CONFIG?.rules || [])) {
+    if (!ruleMatches(rule, ticketTextLower, tokenSet)) continue;
 
     for (const s of (rule.suggest || [])) {
       const email = normalizeEmail(s.email);
-      if (email && !isExcluded(email)) {
-        suggestions.push({
-          email,
-          confidence: "High (keyword rule)",
-          reason: `Rule match: ${rule.id}`,
-          ruleId: rule.id,
-        });
-      }
+      if (!email) continue;
+      if (!isValidCandidateEmail(email, requesterEmail)) continue;
+
+      suggestions.push({
+        email,
+        confidence: "High (keyword rule)",
+        reason: `Rule match: ${rule.id}`,
+        ruleId: rule.id
+      });
     }
   }
 
-  // Dedup by email
+  // dedupe by email
   const seen = new Set();
   return suggestions.filter(s => (seen.has(s.email) ? false : (seen.add(s.email), true)));
 }
 
 /* =========================
-   Env + Freshdesk client
+   FRESHDESK SETUP
    ========================= */
 
 const rawDomain = process.env.FRESHDESK_DOMAIN;
@@ -237,12 +204,14 @@ const baseURL = buildBaseUrl(freshdeskDomain);
 
 const SALES_HELP_GROUP_ID = String(process.env.SALES_HELP_GROUP_ID || "").trim();
 const FRESHDESK_API_KEY = process.env.FRESHDESK_API_KEY;
+const CONFIG_TOKEN = String(process.env.CONFIG_TOKEN || "").trim();
 
-console.log("FRESHDESK_DOMAIN raw:", JSON.stringify(rawDomain));
 console.log("FRESHDESK_DOMAIN sanitized:", JSON.stringify(freshdeskDomain));
 console.log("Freshdesk baseURL:", JSON.stringify(baseURL));
 console.log("SALES_HELP_GROUP_ID:", JSON.stringify(SALES_HELP_GROUP_ID));
 console.log("Has FRESHDESK_API_KEY:", Boolean(FRESHDESK_API_KEY));
+console.log("Loaded excluded emails:", EXCLUDED_EMAILS.size);
+console.log("Loaded rules:", (RULES_CONFIG?.rules || []).length);
 
 const fd = axios.create({
   baseURL,
@@ -270,7 +239,7 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
 }
 
 /* =========================
-   Requester email resolution
+   REQUESTER EMAIL RESOLUTION
    ========================= */
 
 async function getRequesterEmail(ticket, conversationsMaybe) {
@@ -302,7 +271,7 @@ async function getRequesterEmail(ticket, conversationsMaybe) {
 }
 
 /* =========================
-   Loop-in extraction (TO/CC/BCC minus requester/system/excludes)
+   LOOP-IN EXTRACTION
    ========================= */
 
 function collectLoopInRecipientsFromOutgoing(convs, requesterEmail) {
@@ -325,10 +294,29 @@ function collectLoopInRecipientsFromOutgoing(convs, requesterEmail) {
 }
 
 /* =========================
-   Routes
+   ROUTES
    ========================= */
 
 app.get("/health", (req, res) => res.send("ok"));
+
+/**
+ * Protected debug endpoint
+ * Usage: /config?token=YOUR_CONFIG_TOKEN
+ */
+app.get("/config", (req, res) => {
+  const token = String(req.query.token || "");
+  if (!CONFIG_TOKEN || token !== CONFIG_TOKEN) {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  return res.json({
+    max_suggested_contacts: MAX_SUGGESTED_CONTACTS,
+    excluded_emails_count: EXCLUDED_EMAILS.size,
+    excluded_inboxes: Array.from(EXCLUDED_INBOXES),
+    system_prefixes: SYSTEM_PREFIXES,
+    rules_loaded: (RULES_CONFIG?.rules || []).map(r => r.id),
+  });
+});
 
 app.get("/suggest", async (req, res) => {
   const ticketId = String(req.query.ticketId || "").trim();
@@ -344,7 +332,6 @@ app.get("/suggest", async (req, res) => {
       fd.get(`/tickets/${ticketId}`),
       fd.get(`/tickets/${ticketId}/conversations`),
     ]);
-
     const currentConvs = Array.isArray(currentConvsRaw) ? currentConvsRaw : [];
 
     if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
@@ -353,18 +340,15 @@ app.get("/suggest", async (req, res) => {
 
     const requesterEmail = await getRequesterEmail(ticket, currentConvs);
 
-    // Build ticket text for rule matching + similarity
     const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
     const ticketTextLower = ticketText.toLowerCase();
 
-    /* ---------- Rule-based loop-ins (deterministic) ---------- */
-    const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower)
-      .filter(s => s.email !== normalizeEmail(requesterEmail))
+    /* ---------- Rule-based loop-ins ---------- */
+    const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail)
       .slice(0, MAX_SUGGESTED_CONTACTS);
 
-    /* ---------- A) Similar tickets ---------- */
+    /* ---------- Similar tickets ---------- */
     const currentTokens = tokenize(ticketTextLower);
-
     const freq = new Map();
     for (const w of currentTokens) freq.set(w, (freq.get(w) || 0) + 1);
     const topWords = new Set(
@@ -412,10 +396,8 @@ app.get("/suggest", async (req, res) => {
       const candTokens = tokenize(text);
       let overlap = 0;
       for (const w of candTokens) if (topWords.has(w)) overlap++;
-
       const subj = String(ticket.subject || "").toLowerCase().trim();
       if (subj && String(text).toLowerCase().includes(subj)) overlap += 5;
-
       return overlap;
     }
 
@@ -435,13 +417,23 @@ app.get("/suggest", async (req, res) => {
     const similarTickets = ranked.slice(0, 3);
 
     /* ---------- History/current-loop-in contacts ---------- */
-    const contactScores = new Map();
+    // NOTE: we keep this simple: current ticket outgoing recipients minus requester/system/excludes,
+    // plus similar ticket recipients (top 5) if needed.
+    const historySet = new Map(); // email -> {score, ticketCount, sawCurrent}
 
-    // Current ticket loop-ins
+    function bump(email, points, sawCurrent, ticketRef) {
+      const e = normalizeEmail(email);
+      if (!isValidCandidateEmail(e, requesterEmail)) return;
+      if (!historySet.has(e)) historySet.set(e, { email: e, score: 0, tickets: new Set(), sawCurrent: false });
+      const obj = historySet.get(e);
+      obj.score += points;
+      if (ticketRef) obj.tickets.add(String(ticketRef));
+      if (sawCurrent) obj.sawCurrent = true;
+    }
+
     const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
-    for (const e of currentLoopIns) addContactHit(contactScores, e, 50, "current_loopin", ticketId);
+    for (const e of currentLoopIns) bump(e, 50, true, ticketId);
 
-    // Similar ticket loop-ins (up to top 5)
     const similarForContacts = ranked.slice(0, 5).map(t => t.id);
     if (similarForContacts.length) {
       const similarData = await Promise.all(
@@ -458,19 +450,17 @@ app.get("/suggest", async (req, res) => {
 
       for (const item of similarData) {
         const loopIns = collectLoopInRecipientsFromOutgoing(item.convs, item.reqEmail);
-        for (const e of loopIns) addContactHit(contactScores, e, 10, "similar_loopin", item.id);
+        for (const e of loopIns) bump(e, 10, false, item.id);
       }
     }
 
-    let historyBased = Array.from(contactScores.values())
-      .map(c => ({
-        email: c.email,
-        score: c.score,
-        ticketCount: c.tickets.size,
-        sawCurrent: c.sawCurrent,
-        reasons: c.reasons,
+    const historyBased = Array.from(historySet.values())
+      .map(o => ({
+        email: o.email,
+        score: o.score,
+        ticketCount: o.tickets.size,
+        sawCurrent: o.sawCurrent,
       }))
-      .filter(c => isValidCandidateEmail(c.email, requesterEmail))
       .sort((a, b) => {
         const aCur = a.sawCurrent ? 1 : 0;
         const bCur = b.sawCurrent ? 1 : 0;
@@ -478,19 +468,19 @@ app.get("/suggest", async (req, res) => {
         if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
         return b.score - a.score;
       })
-      .map(c => ({
-        email: c.email,
-        confidence: c.sawCurrent ? "High (added on this ticket)" : "High (added on similar tickets)",
-        evidence: { score: c.score, ticketCount: c.ticketCount, reasons: c.reasons },
+      .map(o => ({
+        email: o.email,
+        confidence: o.sawCurrent ? "High (added on this ticket)" : "High (added on similar tickets)",
+        evidence: { score: o.score, ticketCount: o.ticketCount }
       }));
 
-    /* ---------- Merge rule-based + history-based, max 2 ---------- */
+    /* ---------- Merge rule-based + history-based (max N) ---------- */
     const merged = [];
     const seen = new Set();
 
     for (const r of ruleBasedLoopIns) {
       if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
-      if (!seen.has(r.email) && !isExcluded(r.email) && r.email !== normalizeEmail(requesterEmail)) {
+      if (!seen.has(r.email)) {
         seen.add(r.email);
         merged.push({ email: r.email, confidence: r.confidence, reason: r.reason, source: "rule" });
       }
@@ -498,7 +488,7 @@ app.get("/suggest", async (req, res) => {
 
     for (const h of historyBased) {
       if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
-      if (!seen.has(h.email) && !isExcluded(h.email) && h.email !== normalizeEmail(requesterEmail)) {
+      if (!seen.has(h.email)) {
         seen.add(h.email);
         merged.push({ email: h.email, confidence: h.confidence, source: "history", evidence: h.evidence });
       }
@@ -507,11 +497,11 @@ app.get("/suggest", async (req, res) => {
     return res.json({
       ticketId,
       subject: ticket.subject,
-      requesterEmail: requesterEmail || null,
+      requesterEmail: requesterEmail || null, // debug; remove later if desired
       similarTickets,
       ruleBasedLoopIns,
       suggestedExternalContacts: merged,
-      message: "A+B MVP ✅ (rules updated: order-independent combos; convert excludes only lead convert)",
+      message: "Config-driven V1 ✅ (rules.json + excluded_emails.json)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

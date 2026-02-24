@@ -49,24 +49,55 @@ function confidenceLabel(score) {
   return "Low";
 }
 
+/* ---------------- B FILTERS ---------------- */
+
+// If your Sales Help distro differs, change this one line.
+const SALES_HELP_INBOX = "saleshelp@scorpion.co";
+
+const SYSTEM_EMAIL_PATTERNS = [
+  /^freshdesk/i,     // freshdeskbcc@..., freshdesk@...
+  /^no-?reply/i,
+  /^notifications?/i,
+];
+
+function isSystemEmail(email) {
+  const e = String(email || "").toLowerCase();
+  return SYSTEM_EMAIL_PATTERNS.some(re => re.test(e));
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidCandidateEmail(email, requesterEmail) {
+  const e = normalizeEmail(email);
+  const r = normalizeEmail(requesterEmail);
+
+  if (!e) return false;
+  if (e === SALES_HELP_INBOX) return false;
+  if (isSystemEmail(e)) return false;
+  if (r && e === r) return false; // critical: exclude requester/customer
+  return true;
+}
+
 function addContactHit(map, email, points, reason, ticketId) {
-  if (!email) return;
-  const key = String(email).toLowerCase();
-  if (!map.has(key)) {
-    map.set(key, {
-      email: key,
+  const e = normalizeEmail(email);
+  if (!e) return;
+
+  if (!map.has(e)) {
+    map.set(e, {
+      email: e,
       score: 0,
       reasons: {},
       tickets: new Set(),
-      flags: { sawCc: false, sawBcc: false }
+      flags: { sawCurrent: false }
     });
   }
-  const obj = map.get(key);
+  const obj = map.get(e);
   obj.score += points;
   obj.reasons[reason] = (obj.reasons[reason] || 0) + points;
   if (ticketId != null) obj.tickets.add(String(ticketId));
-  if (reason === "cc_email") obj.flags.sawCc = true;
-  if (reason === "bcc_email") obj.flags.sawBcc = true;
+  if (reason.startsWith("current_")) obj.flags.sawCurrent = true;
 }
 
 /* ---------------- ENV ---------------- */
@@ -111,6 +142,63 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   return all;
 }
 
+/* ---------------- Requester email resolution ---------------- */
+
+async function getRequesterEmail(ticket, conversationsMaybe) {
+  // 1) Try direct fields (vary by account/plan)
+  const direct =
+    normalizeEmail(ticket?.requester?.email) ||
+    normalizeEmail(ticket?.requester_email) ||
+    normalizeEmail(ticket?.email);
+
+  if (direct) return direct;
+
+  // 2) Try contacts endpoint by requester_id (if allowed)
+  const requesterId = ticket?.requester_id;
+  if (requesterId) {
+    try {
+      const { data } = await fd.get(`/contacts/${requesterId}`);
+      const cEmail = normalizeEmail(data?.email);
+      if (cEmail) return cEmail;
+    } catch {
+      // ignore if not permitted
+    }
+  }
+
+  // 3) Fallback: earliest incoming conversation from_email
+  const convs = Array.isArray(conversationsMaybe) ? conversationsMaybe : [];
+  const incoming = convs
+    .filter(c => c?.incoming === true && c?.from_email)
+    .sort((a, b) => (a?.created_at || "").localeCompare(b?.created_at || ""));
+
+  if (incoming.length) return normalizeEmail(incoming[0].from_email);
+
+  return "";
+}
+
+/* ---------------- Extract loop-in recipients ---------------- */
+
+function collectLoopInRecipientsFromOutgoing(convs, requesterEmail) {
+  const out = new Set();
+  const list = Array.isArray(convs) ? convs : [];
+
+  for (const conv of list) {
+    const incoming = conv?.incoming === true;
+    if (incoming) continue; // only outgoing replies
+
+    const toList = Array.isArray(conv?.to_emails) ? conv.to_emails : [];
+    const ccList = Array.isArray(conv?.cc_emails) ? conv.cc_emails : [];
+    const bccList = Array.isArray(conv?.bcc_emails) ? conv.bcc_emails : [];
+
+    for (const e of [...toList, ...ccList, ...bccList]) {
+      const email = normalizeEmail(e);
+      if (isValidCandidateEmail(email, requesterEmail)) out.add(email);
+    }
+  }
+
+  return Array.from(out);
+}
+
 /* ---------------- ROUTES ---------------- */
 
 app.get("/health", (req, res) => res.send("ok"));
@@ -124,13 +212,21 @@ app.get("/suggest", async (req, res) => {
   if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
 
   try {
-    /* ---------- A) Similar Tickets ---------- */
+    /* ---------- Read current ticket + conversations ---------- */
+    const [{ data: ticket }, { data: currentConvsRaw }] = await Promise.all([
+      fd.get(`/tickets/${ticketId}`),
+      fd.get(`/tickets/${ticketId}/conversations`),
+    ]);
 
-    const { data: ticket } = await fd.get(`/tickets/${ticketId}`);
+    const currentConvs = Array.isArray(currentConvsRaw) ? currentConvsRaw : [];
 
     if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
       return res.json({ hide: true, reason: "Not Sales Help", group_id: ticket.group_id });
     }
+
+    const requesterEmail = await getRequesterEmail(ticket, currentConvs);
+
+    /* ---------- A) Similar Tickets ---------- */
 
     const currentText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
     const currentTokens = tokenize(currentText);
@@ -205,108 +301,75 @@ app.get("/suggest", async (req, res) => {
 
     const similarTickets = ranked.slice(0, 3);
 
-    /* ---------- B) Suggested External Contacts (0–2) ---------- */
-    // IMPORTANT FIXES:
-    // - DO NOT use to_emails (contains requester/customer like Tim)
-    // - ONLY use cc_emails + bcc_emails on outgoing messages + ticket-level cc_emails
-    // - Filter out Freshdesk system emails (freshdesk*), and the Sales Help mailbox itself
-
-    const SYSTEM_EMAIL_PATTERNS = [
-      /^freshdesk/i,                 // freshdeskbcc@..., freshdesk@...
-      /^no-?reply/i,
-      /^notifications?/i,
-    ];
-
-    const SALES_HELP_INBOX = "saleshelp@scorpion.co"; // adjust if needed
-
-    function isSystemEmail(email) {
-      const e = String(email || "").toLowerCase();
-      return SYSTEM_EMAIL_PATTERNS.some(re => re.test(e));
-    }
+    /* ---------- B) Suggested external contacts ---------- */
+    // New definition (your clarification):
+    // Any TO/CC/BCC on an outgoing reply that is NOT the requester, and NOT system Freshdesk emails.
 
     const contactScores = new Map();
 
-    // (Optional) use up to 5 similar tickets for better contact evidence, still display top 3 for A
+    // B1) CURRENT ticket loop-ins (highest priority)
+    const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
+    for (const e of currentLoopIns) {
+      addContactHit(contactScores, e, 50, "current_loopin", ticketId); // strong: used on this ticket
+    }
+
+    // B2) Similar tickets loop-ins (only if we still need candidates)
+    // Use up to top 5 similar tickets for extra evidence, but still cap to 2 final.
     const similarForContacts = ranked.slice(0, 5).map(t => t.id);
 
-    const similarData = await Promise.all(
-      similarForContacts.map(async (id) => {
-        const [tRes, cRes] = await Promise.all([
-          fd.get(`/tickets/${id}`),
-          fd.get(`/tickets/${id}/conversations`),
-        ]);
-        return { ticket: tRes.data, conversations: cRes.data, id };
-      })
-    );
+    if (contactScores.size < 4 && similarForContacts.length) {
+      const similarData = await Promise.all(
+        similarForContacts.map(async (id) => {
+          const [{ data: t }, { data: convsRaw }] = await Promise.all([
+            fd.get(`/tickets/${id}`),
+            fd.get(`/tickets/${id}/conversations`),
+          ]);
+          const convs = Array.isArray(convsRaw) ? convsRaw : [];
+          const reqEmail = await getRequesterEmail(t, convs);
+          return { id, ticket: t, convs, reqEmail };
+        })
+      );
 
-    for (const item of similarData) {
-      const t = item.ticket;
+      for (const item of similarData) {
+        const loopIns = collectLoopInRecipientsFromOutgoing(item.convs, item.reqEmail);
 
-      // Ticket-level CCs
-      const ticketCC = Array.isArray(t.cc_emails) ? t.cc_emails : [];
-      for (const e of ticketCC) {
-        const email = String(e || "").toLowerCase();
-        if (!email) continue;
-        if (email === SALES_HELP_INBOX) continue;
-        if (isSystemEmail(email)) continue;
-        addContactHit(contactScores, email, 8, "cc_email", item.id); // strong signal
-      }
-
-      const convs = Array.isArray(item.conversations) ? item.conversations : [];
-      for (const conv of convs) {
-        const incoming = conv?.incoming === true;
-        if (incoming) continue; // only outgoing
-
-        const ccList = Array.isArray(conv?.cc_emails) ? conv.cc_emails : [];
-        const bccList = Array.isArray(conv?.bcc_emails) ? conv.bcc_emails : [];
-
-        for (const e of ccList) {
-          const email = String(e || "").toLowerCase();
-          if (!email) continue;
-          if (email === SALES_HELP_INBOX) continue;
-          if (isSystemEmail(email)) continue;
-          addContactHit(contactScores, email, 8, "cc_email", item.id);
-        }
-
-        for (const e of bccList) {
-          const email = String(e || "").toLowerCase();
-          if (!email) continue;
-          if (email === SALES_HELP_INBOX) continue;
-          if (isSystemEmail(email)) continue;
-          addContactHit(contactScores, email, 8, "bcc_email", item.id);
+        for (const e of loopIns) {
+          // slightly lower than current ticket, but still strong
+          addContactHit(contactScores, e, 10, "similar_loopin", item.id);
         }
       }
     }
 
-    // Strong-only: must be CC/BCC at least once
+    // Select up to 2 contacts
     const suggestedExternalContacts = Array.from(contactScores.values())
       .map(c => ({
         email: c.email,
         score: c.score,
         ticketCount: c.tickets.size,
-        sawLoopIn: (c.flags.sawCc || c.flags.sawBcc),
+        sawCurrent: c.flags.sawCurrent,
         reasons: c.reasons,
       }))
-      .filter(c => c.sawLoopIn)
       .sort((a, b) => {
+        const aCur = a.sawCurrent ? 1 : 0;
+        const bCur = b.sawCurrent ? 1 : 0;
+        if (bCur !== aCur) return bCur - aCur;
         if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
         return b.score - a.score;
       })
       .slice(0, 2)
       .map(c => ({
         email: c.email,
-        confidence: c.ticketCount >= 2
-          ? "High (looped in across multiple similar tickets)"
-          : "High (explicitly looped in on a similar ticket)",
+        confidence: c.sawCurrent ? "High (added on this ticket)" : "High (added on similar tickets)",
         evidence: { score: c.score, ticketCount: c.ticketCount, reasons: c.reasons },
       }));
 
     return res.json({
       ticketId,
       subject: ticket.subject,
+      requesterEmail: requesterEmail || null, // helpful debug; remove later if you want
       similarTickets,
       suggestedExternalContacts,
-      message: "A+B MVP ✅ (B uses only outgoing CC/BCC + ticket CC; excludes system + requester)",
+      message: "A+B MVP ✅ (B = outgoing TO/CC/BCC minus requester/system; includes current ticket)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

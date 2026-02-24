@@ -49,13 +49,6 @@ function confidenceLabel(score) {
   return "Low";
 }
 
-function extractEmailsFromText(text) {
-  const s = String(text || "");
-  const re = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
-  const matches = s.match(re) || [];
-  return matches.map(e => e.toLowerCase());
-}
-
 function addContactHit(map, email, points, reason, ticketId) {
   if (!email) return;
   const key = String(email).toLowerCase();
@@ -65,14 +58,13 @@ function addContactHit(map, email, points, reason, ticketId) {
       score: 0,
       reasons: {},
       tickets: new Set(),
-      flags: { sawTo: false, sawCc: false, sawBcc: false }
+      flags: { sawCc: false, sawBcc: false }
     });
   }
   const obj = map.get(key);
   obj.score += points;
   obj.reasons[reason] = (obj.reasons[reason] || 0) + points;
   if (ticketId != null) obj.tickets.add(String(ticketId));
-  if (reason === "to_email") obj.flags.sawTo = true;
   if (reason === "cc_email") obj.flags.sawCc = true;
   if (reason === "bcc_email") obj.flags.sawBcc = true;
 }
@@ -214,15 +206,31 @@ app.get("/suggest", async (req, res) => {
     const similarTickets = ranked.slice(0, 3);
 
     /* ---------- B) Suggested External Contacts (0–2) ---------- */
-    // Definition: someone you explicitly looped in (OUTGOING TO/CC/BCC) on similar tickets.
-    // Exclude requester/customer signals (incoming from_email/body).
-    // Exclude the Sales Help distro itself.
+    // IMPORTANT FIXES:
+    // - DO NOT use to_emails (contains requester/customer like Tim)
+    // - ONLY use cc_emails + bcc_emails on outgoing messages + ticket-level cc_emails
+    // - Filter out Freshdesk system emails (freshdesk*), and the Sales Help mailbox itself
+
+    const SYSTEM_EMAIL_PATTERNS = [
+      /^freshdesk/i,                 // freshdeskbcc@..., freshdesk@...
+      /^no-?reply/i,
+      /^notifications?/i,
+    ];
+
+    const SALES_HELP_INBOX = "saleshelp@scorpion.co"; // adjust if needed
+
+    function isSystemEmail(email) {
+      const e = String(email || "").toLowerCase();
+      return SYSTEM_EMAIL_PATTERNS.some(re => re.test(e));
+    }
 
     const contactScores = new Map();
-    const topSimilarIds = similarTickets.map(t => t.id);
+
+    // (Optional) use up to 5 similar tickets for better contact evidence, still display top 3 for A
+    const similarForContacts = ranked.slice(0, 5).map(t => t.id);
 
     const similarData = await Promise.all(
-      topSimilarIds.map(async (id) => {
+      similarForContacts.map(async (id) => {
         const [tRes, cRes] = await Promise.all([
           fd.get(`/tickets/${id}`),
           fd.get(`/tickets/${id}/conversations`),
@@ -234,43 +242,51 @@ app.get("/suggest", async (req, res) => {
     for (const item of similarData) {
       const t = item.ticket;
 
-      // Ticket-level CCs (loop-in)
-      const cc = Array.isArray(t.cc_emails) ? t.cc_emails : [];
-      for (const e of cc) {
+      // Ticket-level CCs
+      const ticketCC = Array.isArray(t.cc_emails) ? t.cc_emails : [];
+      for (const e of ticketCC) {
         const email = String(e || "").toLowerCase();
-        if (email) addContactHit(contactScores, email, 6, "cc_email", item.id);
+        if (!email) continue;
+        if (email === SALES_HELP_INBOX) continue;
+        if (isSystemEmail(email)) continue;
+        addContactHit(contactScores, email, 8, "cc_email", item.id); // strong signal
       }
 
       const convs = Array.isArray(item.conversations) ? item.conversations : [];
       for (const conv of convs) {
         const incoming = conv?.incoming === true;
+        if (incoming) continue; // only outgoing
 
-        // Only count loop-ins on OUTGOING messages
-        if (incoming) continue;
-
-        const toList = Array.isArray(conv?.to_emails) ? conv.to_emails : [];
         const ccList = Array.isArray(conv?.cc_emails) ? conv.cc_emails : [];
         const bccList = Array.isArray(conv?.bcc_emails) ? conv.bcc_emails : [];
 
-        for (const e of toList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "to_email", item.id);
-        for (const e of ccList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "cc_email", item.id);
-        for (const e of bccList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "bcc_email", item.id);
+        for (const e of ccList) {
+          const email = String(e || "").toLowerCase();
+          if (!email) continue;
+          if (email === SALES_HELP_INBOX) continue;
+          if (isSystemEmail(email)) continue;
+          addContactHit(contactScores, email, 8, "cc_email", item.id);
+        }
+
+        for (const e of bccList) {
+          const email = String(e || "").toLowerCase();
+          if (!email) continue;
+          if (email === SALES_HELP_INBOX) continue;
+          if (isSystemEmail(email)) continue;
+          addContactHit(contactScores, email, 8, "bcc_email", item.id);
+        }
       }
     }
 
-    // filter out your group mailbox if it appears
-    const SALES_HELP_INBOX = "saleshelp@scorpion.co"; // adjust if your actual distro differs
-
+    // Strong-only: must be CC/BCC at least once
     const suggestedExternalContacts = Array.from(contactScores.values())
       .map(c => ({
         email: c.email,
         score: c.score,
         ticketCount: c.tickets.size,
-        sawLoopIn: (c.flags.sawTo || c.flags.sawCc || c.flags.sawBcc),
+        sawLoopIn: (c.flags.sawCc || c.flags.sawBcc),
         reasons: c.reasons,
       }))
-      .filter(c => c.email !== SALES_HELP_INBOX)
-      // Strong-only: must be explicitly looped in at least once
       .filter(c => c.sawLoopIn)
       .sort((a, b) => {
         if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
@@ -290,7 +306,7 @@ app.get("/suggest", async (req, res) => {
       subject: ticket.subject,
       similarTickets,
       suggestedExternalContacts,
-      message: "A+B MVP ✅ (B only counts loop-ins on outgoing TO/CC/BCC)",
+      message: "A+B MVP ✅ (B uses only outgoing CC/BCC + ticket CC; excludes system + requester)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

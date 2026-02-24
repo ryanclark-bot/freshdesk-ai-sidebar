@@ -43,7 +43,7 @@ try {
 const MAX_SUGGESTED_CONTACTS = Math.max(1, Number(RULES_CONFIG?.max_suggested_contacts || 2));
 
 /* =========================
-   SIMILARITY TUNING (edit here if needed)
+   SIMILARITY TUNING
    ========================= */
 
 // Prefer tickets updated within this many days
@@ -66,6 +66,9 @@ const BIGRAM_BONUS = 6;
 
 // Recency bonus max
 const RECENCY_BONUS_MAX = 8;
+
+// Shared URL host bonus (ex: csx.scorpion.co)
+const SHARED_HOST_BONUS = 25;
 
 /* =========================
    HELPERS
@@ -108,14 +111,23 @@ function daysAgoFromIso(iso) {
   return ageMs / (1000 * 60 * 60 * 24);
 }
 
-// Tokenize geared for support tickets
+// Tokenize geared for support tickets (UPDATED stopwords)
 function tokenize(text) {
   const stop = new Set([
+    // general stopwords
     "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
     "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
     "would","will","just","please","thanks","thank",
-    // extra support-y fluff:
-    "help","urgent","update","issue","question","ticket","request","need","needed","asap"
+
+    // extra support fluff
+    "help","urgent","update","issue","question","ticket","request","need","needed","asap",
+
+    // org-specific / very generic internal words (IMPORTANT)
+    "team","hi","hello","regards",
+    "scorpion","saleshelp","support",
+    "client","clients","customer","customers",
+    "account","accounts",
+    "looking","trying","figure","proper","way"
   ]);
 
   return String(text || "")
@@ -130,6 +142,24 @@ function makeBigrams(tokens) {
     out.add(`${tokens[i]} ${tokens[i + 1]}`);
   }
   return out;
+}
+
+function extractUrlHosts(text) {
+  const hosts = new Set();
+  const s = String(text || "");
+  const re = /https?:\/\/([^\/\s]+)/gi;
+  let m;
+  while ((m = re.exec(s))) {
+    hosts.add(m[1].toLowerCase());
+  }
+  return hosts;
+}
+
+function sharedHostBonus(currentHosts, candidateHosts) {
+  if (!currentHosts.size || !candidateHosts.size) return 0;
+  let shared = 0;
+  for (const h of currentHosts) if (candidateHosts.has(h)) shared++;
+  return shared * SHARED_HOST_BONUS;
 }
 
 /* =========================
@@ -255,7 +285,7 @@ const fd = axios.create({
 });
 
 /**
- * Freshdesk search quirk you saw:
+ * Freshdesk search quirk:
  * - query must be wrapped in quotes: query="status:2"
  * - page <= 10
  */
@@ -333,7 +363,6 @@ function collectLoopInRecipientsFromOutgoing(convs, requesterEmail) {
    ========================= */
 
 function buildIdfMap(candidateDocsTokens) {
-  // candidateDocsTokens: Array<Set<string>>
   const df = new Map();
   const N = candidateDocsTokens.length || 1;
 
@@ -345,7 +374,6 @@ function buildIdfMap(candidateDocsTokens) {
 
   const idf = new Map();
   for (const [tok, dfi] of df.entries()) {
-    // IDF-lite: log((N+1)/(df+1)) + 1
     const val = Math.log((N + 1) / (dfi + 1)) + 1;
     idf.set(tok, val);
   }
@@ -374,11 +402,11 @@ function recencyBonus(updatedAtIso) {
   if (ageDays == null) return 0;
 
   if (ageDays <= RECENT_DAYS) {
-    const frac = (RECENT_DAYS - ageDays) / RECENT_DAYS; // 0..1
+    const frac = (RECENT_DAYS - ageDays) / RECENT_DAYS;
     return frac * RECENCY_BONUS_MAX;
   }
-  if (ageDays >= OLD_DAYS) return -RECENCY_BONUS_MAX; // very old -> penalty
-  // between RECENT and OLD -> mild penalty
+  if (ageDays >= OLD_DAYS) return -RECENCY_BONUS_MAX;
+
   const frac = (ageDays - RECENT_DAYS) / (OLD_DAYS - RECENT_DAYS);
   return -frac * (RECENCY_BONUS_MAX / 2);
 }
@@ -415,7 +443,8 @@ app.get("/config", (req, res) => {
       RERANK_FETCH_LIMIT,
       RULE_ANCHOR_BONUS,
       BIGRAM_BONUS,
-      RECENCY_BONUS_MAX
+      RECENCY_BONUS_MAX,
+      SHARED_HOST_BONUS
     }
   });
 });
@@ -429,7 +458,6 @@ app.get("/suggest", async (req, res) => {
   if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
 
   try {
-    // Read current ticket + conversations
     const [{ data: ticket }, { data: currentConvsRaw }] = await Promise.all([
       fd.get(`/tickets/${ticketId}`),
       fd.get(`/tickets/${ticketId}/conversations`),
@@ -442,20 +470,20 @@ app.get("/suggest", async (req, res) => {
 
     const requesterEmail = await getRequesterEmail(ticket, currentConvs);
 
-    const ticketText =
-      `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
+    const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
     const ticketTextLower = ticketText.toLowerCase();
 
-    // Which rules fire on this ticket? (used for both suggestions + similarity anchoring)
     const currentRuleIds = firedRuleIds(ticketTextLower);
+    const currentTokenSet = new Set(tokenize(ticketTextLower));
+    const currentBigrams = makeBigrams(tokenize(ticketTextLower));
+    const currentHosts = extractUrlHosts(ticketText);
 
     /* ---------- Rule-based loop-ins ---------- */
     const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail)
       .slice(0, MAX_SUGGESTED_CONTACTS);
 
-    /* ---------- Similar tickets: improved scoring ---------- */
+    /* ---------- Similar tickets ---------- */
 
-    // Candidate pool: resolved + closed
     const [resolved, closed] = await Promise.all([
       searchTicketsPaged("status:4", 10),
       searchTicketsPaged("status:5", 10),
@@ -463,26 +491,20 @@ app.get("/suggest", async (req, res) => {
 
     const pooled = uniqById([...resolved, ...closed]);
 
-    // Filter to Sales Help group and not current ticket
-    // Also apply a soft recency filter by default (keep older but they'll be downranked)
     const candidates = pooled
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
       .filter(t => String(t.id) !== ticketId);
 
-    // Build IDF map based on candidate subjects (cheap)
+    // IDF map based on candidate subjects (cheap)
     const candidateSubjectTokenSets = candidates.map(t => new Set(tokenize(t.subject || "")));
     const idfMap = buildIdfMap(candidateSubjectTokenSets);
 
-    const currentTokenSet = new Set(tokenize(ticketTextLower));
-    const currentBigrams = makeBigrams(tokenize(ticketTextLower));
-
-    // Fast pass: score candidates using subject only + recency + (optional) rule anchor using subject text
-    // We'll compute candidateRuleIds from subject for pass1 (cheap). Pass2 uses full text.
+    // Pass 1: subject scoring + rule anchor + recency
     const scoredPass1 = candidates.map(t => {
       const subj = String(t.subject || "");
       const subjLower = subj.toLowerCase();
-      const candTokenSet = new Set(tokenize(subjLower));
 
+      const candTokenSet = new Set(tokenize(subjLower));
       const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
       const bigram = bigramBonus(currentBigrams, subjLower);
       const rec = recencyBonus(t.updated_at || t.created_at);
@@ -490,7 +512,10 @@ app.get("/suggest", async (req, res) => {
       const candRuleIds = firedRuleIds(subjLower);
       const ruleBonus = sharedRuleBonus(currentRuleIds, candRuleIds);
 
-      const score = base + bigram + rec + ruleBonus;
+      const candHosts = extractUrlHosts(subj);
+      const hostBonus = sharedHostBonus(currentHosts, candHosts);
+
+      const score = base + bigram + rec + ruleBonus + hostBonus;
 
       return {
         id: t.id,
@@ -500,12 +525,11 @@ app.get("/suggest", async (req, res) => {
       };
     });
 
-    // Take top N for full fetch rerank
     const topForFetch = scoredPass1
       .sort((a, b) => b.score1 - a.score1)
       .slice(0, RERANK_FETCH_LIMIT);
 
-    // Fetch full tickets for rerank
+    // Pass 2: full ticket fetch rerank
     const fullTickets = await Promise.all(
       topForFetch.map(async (t) => {
         try {
@@ -515,7 +539,6 @@ app.get("/suggest", async (req, res) => {
           const fullLower = fullText.toLowerCase();
 
           const candTokenSet = new Set(tokenize(fullLower));
-          // Use IDF map built from subject corpus; good enough + cheap
           const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
           const bigram = bigramBonus(currentBigrams, fullLower);
           const rec = recencyBonus(data.updated_at || data.created_at);
@@ -523,39 +546,26 @@ app.get("/suggest", async (req, res) => {
           const candRuleIds = firedRuleIds(fullLower);
           const ruleBonus = sharedRuleBonus(currentRuleIds, candRuleIds);
 
-          // Small extra boost if a candidate shares at least one fired rule (keeps results on-topic)
-          const score = base + bigram + rec + ruleBonus;
+          const candHosts = extractUrlHosts(fullText);
+          const hostBonus = sharedHostBonus(currentHosts, candHosts);
+
+          const score = base + bigram + rec + ruleBonus + hostBonus;
 
           return {
             id: t.id,
             subject: data.subject || t.subject,
             score,
             confidence: confidenceLabel(score),
-            url: `${freshdeskDomain}/a/tickets/${t.id}`,
-            debug: {
-              base,
-              bigram,
-              recency: rec,
-              ruleBonus,
-              updated_at: data.updated_at || data.created_at || null
-            }
+            url: `${freshdeskDomain}/a/tickets/${t.id}`
           };
         } catch {
-          // fallback: if fetch fails, keep pass1
           const score = t.score1;
           return {
             id: t.id,
             subject: t.subject,
             score,
             confidence: confidenceLabel(score),
-            url: `${freshdeskDomain}/a/tickets/${t.id}`,
-            debug: {
-              base: null,
-              bigram: null,
-              recency: recencyBonus(t.updated_at),
-              ruleBonus: null,
-              updated_at: t.updated_at || null
-            }
+            url: `${freshdeskDomain}/a/tickets/${t.id}`
           };
         }
       })
@@ -573,7 +583,7 @@ app.get("/suggest", async (req, res) => {
       }));
 
     /* ---------- History/current-loop-in contacts ---------- */
-    const historySet = new Map(); // email -> {score, tickets, sawCurrent}
+    const historySet = new Map();
 
     function bump(email, points, sawCurrent, ticketRef) {
       const e = normalizeEmail(email);
@@ -588,7 +598,6 @@ app.get("/suggest", async (req, res) => {
     const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
     for (const e of currentLoopIns) bump(e, 50, true, ticketId);
 
-    // Use top 5 similar ticket IDs as evidence
     const similarIdsForContacts = fullTickets
       .sort((a, b) => b.score - a.score)
       .slice(0, 5)
@@ -633,7 +642,7 @@ app.get("/suggest", async (req, res) => {
         evidence: { score: o.score, ticketCount: o.ticketCount }
       }));
 
-    /* ---------- Merge rule-based + history-based (max N) ---------- */
+    /* ---------- Merge loop-ins (max N) ---------- */
     const merged = [];
     const seen = new Set();
 
@@ -656,12 +665,12 @@ app.get("/suggest", async (req, res) => {
     return res.json({
       ticketId,
       subject: ticket.subject,
-      requesterEmail: requesterEmail || null, // debug; remove later if desired
+      requesterEmail: requesterEmail || null,
       firedRuleIds: currentRuleIds,
       similarTickets,
       ruleBasedLoopIns,
       suggestedExternalContacts: merged,
-      message: "Improved similarity ✅ (rule anchoring + recency + IDF-lite + phrases)",
+      message: "Similarity improved ✅ (rule anchoring + recency + IDF-lite + phrases + URL host boost)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length
     });

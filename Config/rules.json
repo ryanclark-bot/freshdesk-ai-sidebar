@@ -1,0 +1,37 @@
+{
+  "max_suggested_contacts": 2,
+  "rules": [
+    {
+      "id": "servicedesk_zoom_signature",
+      "suggest": [
+        { "email": "servicedesk@scorpion.co", "label": "Service Desk" }
+      ],
+      "anyOf": [
+        { "any": ["zoom"] },
+        { "all": ["signature", "phone"] },
+        { "all": ["signature", "email"] }
+      ],
+      "notAny": []
+    },
+    {
+      "id": "reputation_suite",
+      "suggest": [
+        { "email": "julie.kennedy@scorpion.co", "label": "Reputation Suite" }
+      ],
+      "anyOf": [
+        { "any": ["reputation suite"] }
+      ],
+      "notAny": []
+    },
+    {
+      "id": "convert",
+      "suggest": [
+        { "email": "mandy.bennet@scorpion.co", "label": "Convert" }
+      ],
+      "anyOf": [
+        { "any": ["convert", "scorpion convert"] }
+      ],
+      "notAny": ["lead convert"]
+    }
+  ]
+}

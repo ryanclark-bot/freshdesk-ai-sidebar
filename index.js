@@ -32,25 +32,34 @@ const SYSTEM_EMAIL_PATTERNS = [
 ];
 
 // Keyword rules (v1 testing)
+// Matching is token/phrase-based, order-independent for "all" groups.
 const KEYWORD_RULES = [
   {
-    id: "servicedesk_signatures_zoom",
-    matchAny: ["zoom", "email signature", "phone signature"],
-    excludeAny: [],
+    id: "servicedesk_zoom_signature",
     suggest: [{ email: "servicedesk@scorpion.co", label: "Service Desk" }],
+    // Match if ANY of these groups match:
+    // 1) any: zoom
+    // 2) all: signature + phone
+    // 3) all: signature + email
+    anyOf: [
+      { any: ["zoom"] },
+      { all: ["signature", "phone"] },
+      { all: ["signature", "email"] },
+    ],
+    notAny: [], // optional global block list
   },
   {
     id: "reputation_suite",
-    matchAny: ["reputation suite"],
-    excludeAny: [],
     suggest: [{ email: "julie.kennedy@scorpion.co", label: "Reputation Suite" }],
+    anyOf: [{ any: ["reputation suite"] }],
+    notAny: [],
   },
   {
     id: "convert",
-    matchAny: ["convert", "scorpion convert"],
-    // If these phrases appear, do NOT match this rule
-    excludeAny: ["lead convert", "contact convert"],
     suggest: [{ email: "mandy.bennet@scorpion.co", label: "Convert" }],
+    anyOf: [{ any: ["convert", "scorpion convert"] }],
+    // Only block if it says "lead convert"
+    notAny: ["lead convert"],
   },
 ];
 
@@ -86,7 +95,7 @@ function tokenize(text) {
   return String(text || "")
     .toLowerCase()
     .split(/[^a-z0-9]+/g)
-    .filter(w => w && w.length >= 3 && !stop.has(w));
+    .filter(w => w && w.length >= 2 && !stop.has(w)); // keep 2+ chars to catch "id", etc.
 }
 function confidenceLabel(score) {
   if (score >= 12) return "Likely";
@@ -126,30 +135,93 @@ function addContactHit(map, email, points, reason, ticketId) {
   if (reason.startsWith("current_") || reason.startsWith("rule_")) obj.sawCurrent = true;
 }
 
-function textIncludesAny(text, phrases) {
-  const t = String(text || "").toLowerCase();
-  return (phrases || []).some(p => t.includes(String(p).toLowerCase()));
+/* =========================
+   Rule Matching (order-independent)
+   ========================= */
+
+/**
+ * We want:
+ * - "all": every item must appear somewhere (token or phrase)
+ * - "any": at least one item appears
+ * - "notAny": none of these items appear
+ *
+ * Items can be single words ("signature") or phrases ("reputation suite").
+ */
+function textHasPhrase(textLower, phraseLower) {
+  return textLower.includes(phraseLower);
+}
+
+function buildTokenSet(tokens) {
+  return new Set(tokens.map(t => String(t).toLowerCase()));
+}
+
+function itemMatches(textLower, tokenSet, item) {
+  const p = String(item || "").toLowerCase().trim();
+  if (!p) return false;
+
+  // If phrase contains space, do substring match
+  if (p.includes(" ")) return textHasPhrase(textLower, p);
+
+  // Otherwise token match
+  return tokenSet.has(p);
+}
+
+function groupMatches(textLower, tokenSet, group) {
+  const anyList = Array.isArray(group?.any) ? group.any : [];
+  const allList = Array.isArray(group?.all) ? group.all : [];
+
+  if (allList.length > 0) {
+    for (const it of allList) {
+      if (!itemMatches(textLower, tokenSet, it)) return false;
+    }
+    return true;
+  }
+
+  if (anyList.length > 0) {
+    for (const it of anyList) {
+      if (itemMatches(textLower, tokenSet, it)) return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+function ruleMatches(rule, textLower, tokenSet) {
+  // Global blocks
+  const notAny = Array.isArray(rule?.notAny) ? rule.notAny : [];
+  for (const it of notAny) {
+    if (itemMatches(textLower, tokenSet, it)) return false;
+  }
+
+  // anyOf groups
+  const anyOf = Array.isArray(rule?.anyOf) ? rule.anyOf : [];
+  if (anyOf.length === 0) return false;
+
+  return anyOf.some(group => groupMatches(textLower, tokenSet, group));
 }
 
 function buildRuleSuggestions(ticketText) {
+  const textLower = String(ticketText || "").toLowerCase();
+  const tokenSet = buildTokenSet(tokenize(textLower));
+
   const suggestions = [];
   for (const rule of KEYWORD_RULES) {
-    const matched = textIncludesAny(ticketText, rule.matchAny);
-    const excluded = textIncludesAny(ticketText, rule.excludeAny);
-    if (matched && !excluded) {
-      for (const s of rule.suggest) {
-        const email = normalizeEmail(s.email);
-        if (!isExcluded(email)) {
-          suggestions.push({
-            email,
-            confidence: "High (keyword rule)",
-            reason: `Rule match: ${rule.matchAny.join(", ")}${rule.excludeAny?.length ? ` (excluding: ${rule.excludeAny.join(", ")})` : ""}`,
-            ruleId: rule.id,
-          });
-        }
+    if (!ruleMatches(rule, textLower, tokenSet)) continue;
+
+    for (const s of (rule.suggest || [])) {
+      const email = normalizeEmail(s.email);
+      if (email && !isExcluded(email)) {
+        suggestions.push({
+          email,
+          confidence: "High (keyword rule)",
+          reason: `Rule match: ${rule.id}`,
+          ruleId: rule.id,
+        });
       }
     }
   }
+
   // Dedup by email
   const seen = new Set();
   return suggestions.filter(s => (seen.has(s.email) ? false : (seen.add(s.email), true)));
@@ -281,17 +353,17 @@ app.get("/suggest", async (req, res) => {
 
     const requesterEmail = await getRequesterEmail(ticket, currentConvs);
 
-    // Build ticket text for rule matching
-    const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`.toLowerCase();
+    // Build ticket text for rule matching + similarity
+    const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
+    const ticketTextLower = ticketText.toLowerCase();
 
     /* ---------- Rule-based loop-ins (deterministic) ---------- */
-    const ruleBasedLoopIns = buildRuleSuggestions(ticketText)
-      // also exclude requester if rule accidentally points to them
+    const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower)
       .filter(s => s.email !== normalizeEmail(requesterEmail))
       .slice(0, MAX_SUGGESTED_CONTACTS);
 
-    /* ---------- A) Similar tickets (as you have today) ---------- */
-    const currentTokens = tokenize(ticketText);
+    /* ---------- A) Similar tickets ---------- */
+    const currentTokens = tokenize(ticketTextLower);
 
     const freq = new Map();
     for (const w of currentTokens) freq.set(w, (freq.get(w) || 0) + 1);
@@ -348,25 +420,28 @@ app.get("/suggest", async (req, res) => {
     }
 
     const ranked = fullTickets
-      .map(t => ({
-        id: t.id,
-        subject: t.subject,
-        score: scoreFull(t.fullText || t.subject),
-        confidence: confidenceLabel(scoreFull(t.fullText || t.subject)),
-        url: `${freshdeskDomain}/a/tickets/${t.id}`,
-      }))
+      .map(t => {
+        const s = scoreFull(t.fullText || t.subject);
+        return {
+          id: t.id,
+          subject: t.subject,
+          score: s,
+          confidence: confidenceLabel(s),
+          url: `${freshdeskDomain}/a/tickets/${t.id}`,
+        };
+      })
       .sort((a, b) => b.score - a.score);
 
     const similarTickets = ranked.slice(0, 3);
 
-    /* ---------- History/current-loop-in contacts (data-driven) ---------- */
+    /* ---------- History/current-loop-in contacts ---------- */
     const contactScores = new Map();
 
-    // Current ticket loop-ins (TO/CC/BCC on outgoing, minus requester/system/exclude list)
+    // Current ticket loop-ins
     const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
     for (const e of currentLoopIns) addContactHit(contactScores, e, 50, "current_loopin", ticketId);
 
-    // Similar ticket loop-ins (up to top 5 for evidence)
+    // Similar ticket loop-ins (up to top 5)
     const similarForContacts = ranked.slice(0, 5).map(t => t.id);
     if (similarForContacts.length) {
       const similarData = await Promise.all(
@@ -387,7 +462,6 @@ app.get("/suggest", async (req, res) => {
       }
     }
 
-    // Convert to sorted suggestions (still filtered by excludes + requester)
     let historyBased = Array.from(contactScores.values())
       .map(c => ({
         email: c.email,
@@ -415,6 +489,7 @@ app.get("/suggest", async (req, res) => {
     const seen = new Set();
 
     for (const r of ruleBasedLoopIns) {
+      if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
       if (!seen.has(r.email) && !isExcluded(r.email) && r.email !== normalizeEmail(requesterEmail)) {
         seen.add(r.email);
         merged.push({ email: r.email, confidence: r.confidence, reason: r.reason, source: "rule" });
@@ -432,11 +507,11 @@ app.get("/suggest", async (req, res) => {
     return res.json({
       ticketId,
       subject: ticket.subject,
-      requesterEmail: requesterEmail || null, // useful debug; remove later if you want
+      requesterEmail: requesterEmail || null,
       similarTickets,
       ruleBasedLoopIns,
-      suggestedExternalContacts: merged, // final combined suggestions, max 2
-      message: "A+B MVP ✅ (rules + history, excludes applied)",
+      suggestedExternalContacts: merged,
+      message: "A+B MVP ✅ (rules updated: order-independent combos; convert excludes only lead convert)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

@@ -40,10 +40,32 @@ try {
   console.log("WARNING: Could not load config/excluded_emails.json; using defaults:", e.message);
 }
 
-const MAX_SUGGESTED_CONTACTS = Math.max(
-  1,
-  Number(RULES_CONFIG?.max_suggested_contacts || 2)
-);
+const MAX_SUGGESTED_CONTACTS = Math.max(1, Number(RULES_CONFIG?.max_suggested_contacts || 2));
+
+/* =========================
+   SIMILARITY TUNING (edit here if needed)
+   ========================= */
+
+// Prefer tickets updated within this many days
+const RECENT_DAYS = 180;
+
+// Hard downrank anything older than this (still allowed, but weak)
+const OLD_DAYS = 540;
+
+// How many candidates to rerank with full ticket fetch
+const RERANK_FETCH_LIMIT = 35;
+
+// How many to show
+const SIMILAR_TICKETS_TO_RETURN = 3;
+
+// Rule anchor bonus per shared rule
+const RULE_ANCHOR_BONUS = 18;
+
+// Phrase (bigram) bonus when matched
+const BIGRAM_BONUS = 6;
+
+// Recency bonus max
+const RECENCY_BONUS_MAX = 8;
 
 /* =========================
    HELPERS
@@ -65,41 +87,57 @@ function uniqById(tickets) {
   for (const t of tickets) if (t && t.id != null) m.set(String(t.id), t);
   return Array.from(m.values());
 }
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+function confidenceLabel(score) {
+  if (score >= 60) return "Likely";
+  if (score >= 35) return "Possible";
+  return "Low";
+}
 
+function parseDateMs(s) {
+  const ms = Date.parse(String(s || ""));
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function daysAgoFromIso(iso) {
+  const ms = parseDateMs(iso);
+  if (!ms) return null;
+  const ageMs = Date.now() - ms;
+  return ageMs / (1000 * 60 * 60 * 24);
+}
+
+// Tokenize geared for support tickets
 function tokenize(text) {
   const stop = new Set([
     "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
     "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
-    "would","will","just","please","thanks","thank"
+    "would","will","just","please","thanks","thank",
+    // extra support-y fluff:
+    "help","urgent","update","issue","question","ticket","request","need","needed","asap"
   ]);
+
   return String(text || "")
     .toLowerCase()
     .split(/[^a-z0-9]+/g)
     .filter(w => w && w.length >= 2 && !stop.has(w));
 }
 
-function confidenceLabel(score) {
-  if (score >= 12) return "Likely";
-  if (score >= 6) return "Possible";
-  return "Low";
-}
-
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
+function makeBigrams(tokens) {
+  const out = new Set();
+  for (let i = 0; i < tokens.length - 1; i++) {
+    out.add(`${tokens[i]} ${tokens[i + 1]}`);
+  }
+  return out;
 }
 
 /* =========================
    EXCLUSIONS (from JSON)
    ========================= */
 
-const EXCLUDED_EMAILS = new Set(
-  (EXCLUSIONS_CONFIG?.excluded_emails || []).map(normalizeEmail)
-);
-
-const EXCLUDED_INBOXES = new Set(
-  (EXCLUSIONS_CONFIG?.excluded_inboxes || []).map(normalizeEmail)
-);
-
+const EXCLUDED_EMAILS = new Set((EXCLUSIONS_CONFIG?.excluded_emails || []).map(normalizeEmail));
+const EXCLUDED_INBOXES = new Set((EXCLUSIONS_CONFIG?.excluded_inboxes || []).map(normalizeEmail));
 const SYSTEM_PREFIXES = (EXCLUSIONS_CONFIG?.system_email_prefixes || [])
   .map(p => String(p || "").toLowerCase())
   .filter(Boolean);
@@ -117,10 +155,9 @@ function isExcluded(email) {
 function isValidCandidateEmail(email, requesterEmail) {
   const e = normalizeEmail(email);
   const r = normalizeEmail(requesterEmail);
-
   if (!e) return false;
   if (isExcluded(e)) return false;
-  if (r && e === r) return false; // exclude requester/customer
+  if (r && e === r) return false;
   return true;
 }
 
@@ -135,32 +172,22 @@ function buildTokenSet(tokens) {
 function itemMatches(textLower, tokenSet, item) {
   const p = String(item || "").toLowerCase().trim();
   if (!p) return false;
-
-  // phrase match
-  if (p.includes(" ")) return textLower.includes(p);
-
-  // token match
-  return tokenSet.has(p);
+  if (p.includes(" ")) return textLower.includes(p); // phrase
+  return tokenSet.has(p); // token
 }
 
 function groupMatches(textLower, tokenSet, group) {
   const anyList = Array.isArray(group?.any) ? group.any : [];
   const allList = Array.isArray(group?.all) ? group.all : [];
 
-  if (allList.length > 0) {
-    return allList.every(it => itemMatches(textLower, tokenSet, it));
-  }
-  if (anyList.length > 0) {
-    return anyList.some(it => itemMatches(textLower, tokenSet, it));
-  }
+  if (allList.length > 0) return allList.every(it => itemMatches(textLower, tokenSet, it));
+  if (anyList.length > 0) return anyList.some(it => itemMatches(textLower, tokenSet, it));
   return false;
 }
 
 function ruleMatches(rule, textLower, tokenSet) {
   const notAny = Array.isArray(rule?.notAny) ? rule.notAny : [];
-  for (const it of notAny) {
-    if (itemMatches(textLower, tokenSet, it)) return false;
-  }
+  for (const it of notAny) if (itemMatches(textLower, tokenSet, it)) return false;
 
   const anyOf = Array.isArray(rule?.anyOf) ? rule.anyOf : [];
   if (anyOf.length === 0) return false;
@@ -168,10 +195,19 @@ function ruleMatches(rule, textLower, tokenSet) {
   return anyOf.some(group => groupMatches(textLower, tokenSet, group));
 }
 
+function firedRuleIds(ticketTextLower) {
+  const tokenSet = buildTokenSet(tokenize(ticketTextLower));
+  const fired = [];
+  for (const rule of (RULES_CONFIG?.rules || [])) {
+    if (ruleMatches(rule, ticketTextLower, tokenSet)) fired.push(String(rule.id));
+  }
+  return fired;
+}
+
 function buildRuleSuggestions(ticketTextLower, requesterEmail) {
   const tokenSet = buildTokenSet(tokenize(ticketTextLower));
-
   const suggestions = [];
+
   for (const rule of (RULES_CONFIG?.rules || [])) {
     if (!ruleMatches(rule, ticketTextLower, tokenSet)) continue;
 
@@ -189,7 +225,6 @@ function buildRuleSuggestions(ticketTextLower, requesterEmail) {
     }
   }
 
-  // dedupe by email
   const seen = new Set();
   return suggestions.filter(s => (seen.has(s.email) ? false : (seen.add(s.email), true)));
 }
@@ -220,9 +255,9 @@ const fd = axios.create({
 });
 
 /**
- * Your Freshdesk quirks:
- * - query must be wrapped in double quotes, e.g. query="status:2"
- * - page is allowed, but must be <= 10
+ * Freshdesk search quirk you saw:
+ * - query must be wrapped in quotes: query="status:2"
+ * - page <= 10
  */
 async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
   const query = `"${rawQuery}"`;
@@ -294,15 +329,74 @@ function collectLoopInRecipientsFromOutgoing(convs, requesterEmail) {
 }
 
 /* =========================
+   SIMILARITY SCORING
+   ========================= */
+
+function buildIdfMap(candidateDocsTokens) {
+  // candidateDocsTokens: Array<Set<string>>
+  const df = new Map();
+  const N = candidateDocsTokens.length || 1;
+
+  for (const tokenSet of candidateDocsTokens) {
+    for (const tok of tokenSet) {
+      df.set(tok, (df.get(tok) || 0) + 1);
+    }
+  }
+
+  const idf = new Map();
+  for (const [tok, dfi] of df.entries()) {
+    // IDF-lite: log((N+1)/(df+1)) + 1
+    const val = Math.log((N + 1) / (dfi + 1)) + 1;
+    idf.set(tok, val);
+  }
+  return idf;
+}
+
+function overlapScoreIdf(currentTokenSet, candidateTokenSet, idfMap) {
+  let score = 0;
+  for (const tok of candidateTokenSet) {
+    if (!currentTokenSet.has(tok)) continue;
+    score += idfMap.get(tok) || 1;
+  }
+  return score;
+}
+
+function bigramBonus(currentBigrams, candidateTextLower) {
+  let bonus = 0;
+  for (const bg of currentBigrams) {
+    if (candidateTextLower.includes(bg)) bonus += BIGRAM_BONUS;
+  }
+  return bonus;
+}
+
+function recencyBonus(updatedAtIso) {
+  const ageDays = daysAgoFromIso(updatedAtIso);
+  if (ageDays == null) return 0;
+
+  if (ageDays <= RECENT_DAYS) {
+    const frac = (RECENT_DAYS - ageDays) / RECENT_DAYS; // 0..1
+    return frac * RECENCY_BONUS_MAX;
+  }
+  if (ageDays >= OLD_DAYS) return -RECENCY_BONUS_MAX; // very old -> penalty
+  // between RECENT and OLD -> mild penalty
+  const frac = (ageDays - RECENT_DAYS) / (OLD_DAYS - RECENT_DAYS);
+  return -frac * (RECENCY_BONUS_MAX / 2);
+}
+
+function sharedRuleBonus(currentRuleIds, candidateRuleIds) {
+  if (!currentRuleIds.length) return 0;
+  const cand = new Set(candidateRuleIds || []);
+  let shared = 0;
+  for (const id of currentRuleIds) if (cand.has(id)) shared++;
+  return shared * RULE_ANCHOR_BONUS;
+}
+
+/* =========================
    ROUTES
    ========================= */
 
 app.get("/health", (req, res) => res.send("ok"));
 
-/**
- * Protected debug endpoint
- * Usage: /config?token=YOUR_CONFIG_TOKEN
- */
 app.get("/config", (req, res) => {
   const token = String(req.query.token || "");
   if (!CONFIG_TOKEN || token !== CONFIG_TOKEN) {
@@ -315,6 +409,14 @@ app.get("/config", (req, res) => {
     excluded_inboxes: Array.from(EXCLUDED_INBOXES),
     system_prefixes: SYSTEM_PREFIXES,
     rules_loaded: (RULES_CONFIG?.rules || []).map(r => r.id),
+    similarity: {
+      RECENT_DAYS,
+      OLD_DAYS,
+      RERANK_FETCH_LIMIT,
+      RULE_ANCHOR_BONUS,
+      BIGRAM_BONUS,
+      RECENCY_BONUS_MAX
+    }
   });
 });
 
@@ -340,86 +442,138 @@ app.get("/suggest", async (req, res) => {
 
     const requesterEmail = await getRequesterEmail(ticket, currentConvs);
 
-    const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
+    const ticketText =
+      `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
     const ticketTextLower = ticketText.toLowerCase();
+
+    // Which rules fire on this ticket? (used for both suggestions + similarity anchoring)
+    const currentRuleIds = firedRuleIds(ticketTextLower);
 
     /* ---------- Rule-based loop-ins ---------- */
     const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail)
       .slice(0, MAX_SUGGESTED_CONTACTS);
 
-    /* ---------- Similar tickets ---------- */
-    const currentTokens = tokenize(ticketTextLower);
-    const freq = new Map();
-    for (const w of currentTokens) freq.set(w, (freq.get(w) || 0) + 1);
-    const topWords = new Set(
-      Array.from(freq.entries())
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 35)
-        .map(([w]) => w)
-    );
+    /* ---------- Similar tickets: improved scoring ---------- */
 
+    // Candidate pool: resolved + closed
     const [resolved, closed] = await Promise.all([
       searchTicketsPaged("status:4", 10),
       searchTicketsPaged("status:5", 10),
     ]);
 
     const pooled = uniqById([...resolved, ...closed]);
+
+    // Filter to Sales Help group and not current ticket
+    // Also apply a soft recency filter by default (keep older but they'll be downranked)
     const candidates = pooled
       .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
       .filter(t => String(t.id) !== ticketId);
 
-    function scoreSubject(subject) {
-      const candTokens = tokenize(subject);
-      let overlap = 0;
-      for (const w of candTokens) if (topWords.has(w)) overlap++;
-      return overlap;
-    }
+    // Build IDF map based on candidate subjects (cheap)
+    const candidateSubjectTokenSets = candidates.map(t => new Set(tokenize(t.subject || "")));
+    const idfMap = buildIdfMap(candidateSubjectTokenSets);
 
-    const firstPass = candidates
-      .map(t => ({ id: t.id, subject: t.subject || "", score1: scoreSubject(t.subject || "") }))
+    const currentTokenSet = new Set(tokenize(ticketTextLower));
+    const currentBigrams = makeBigrams(tokenize(ticketTextLower));
+
+    // Fast pass: score candidates using subject only + recency + (optional) rule anchor using subject text
+    // We'll compute candidateRuleIds from subject for pass1 (cheap). Pass2 uses full text.
+    const scoredPass1 = candidates.map(t => {
+      const subj = String(t.subject || "");
+      const subjLower = subj.toLowerCase();
+      const candTokenSet = new Set(tokenize(subjLower));
+
+      const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
+      const bigram = bigramBonus(currentBigrams, subjLower);
+      const rec = recencyBonus(t.updated_at || t.created_at);
+
+      const candRuleIds = firedRuleIds(subjLower);
+      const ruleBonus = sharedRuleBonus(currentRuleIds, candRuleIds);
+
+      const score = base + bigram + rec + ruleBonus;
+
+      return {
+        id: t.id,
+        subject: t.subject || "",
+        updated_at: t.updated_at || t.created_at || null,
+        score1: score
+      };
+    });
+
+    // Take top N for full fetch rerank
+    const topForFetch = scoredPass1
       .sort((a, b) => b.score1 - a.score1)
-      .slice(0, 20);
+      .slice(0, RERANK_FETCH_LIMIT);
 
+    // Fetch full tickets for rerank
     const fullTickets = await Promise.all(
-      firstPass.map(async (t) => {
+      topForFetch.map(async (t) => {
         try {
           const { data } = await fd.get(`/tickets/${t.id}`);
-          const txt = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
-          return { ...t, fullText: txt };
+          const fullText =
+            `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
+          const fullLower = fullText.toLowerCase();
+
+          const candTokenSet = new Set(tokenize(fullLower));
+          // Use IDF map built from subject corpus; good enough + cheap
+          const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
+          const bigram = bigramBonus(currentBigrams, fullLower);
+          const rec = recencyBonus(data.updated_at || data.created_at);
+
+          const candRuleIds = firedRuleIds(fullLower);
+          const ruleBonus = sharedRuleBonus(currentRuleIds, candRuleIds);
+
+          // Small extra boost if a candidate shares at least one fired rule (keeps results on-topic)
+          const score = base + bigram + rec + ruleBonus;
+
+          return {
+            id: t.id,
+            subject: data.subject || t.subject,
+            score,
+            confidence: confidenceLabel(score),
+            url: `${freshdeskDomain}/a/tickets/${t.id}`,
+            debug: {
+              base,
+              bigram,
+              recency: rec,
+              ruleBonus,
+              updated_at: data.updated_at || data.created_at || null
+            }
+          };
         } catch {
-          return { ...t, fullText: t.subject };
+          // fallback: if fetch fails, keep pass1
+          const score = t.score1;
+          return {
+            id: t.id,
+            subject: t.subject,
+            score,
+            confidence: confidenceLabel(score),
+            url: `${freshdeskDomain}/a/tickets/${t.id}`,
+            debug: {
+              base: null,
+              bigram: null,
+              recency: recencyBonus(t.updated_at),
+              ruleBonus: null,
+              updated_at: t.updated_at || null
+            }
+          };
         }
       })
     );
 
-    function scoreFull(text) {
-      const candTokens = tokenize(text);
-      let overlap = 0;
-      for (const w of candTokens) if (topWords.has(w)) overlap++;
-      const subj = String(ticket.subject || "").toLowerCase().trim();
-      if (subj && String(text).toLowerCase().includes(subj)) overlap += 5;
-      return overlap;
-    }
-
-    const ranked = fullTickets
-      .map(t => {
-        const s = scoreFull(t.fullText || t.subject);
-        return {
-          id: t.id,
-          subject: t.subject,
-          score: s,
-          confidence: confidenceLabel(s),
-          url: `${freshdeskDomain}/a/tickets/${t.id}`,
-        };
-      })
-      .sort((a, b) => b.score - a.score);
-
-    const similarTickets = ranked.slice(0, 3);
+    const similarTickets = fullTickets
+      .sort((a, b) => b.score - a.score)
+      .slice(0, SIMILAR_TICKETS_TO_RETURN)
+      .map(t => ({
+        id: t.id,
+        subject: t.subject,
+        score: Math.round(t.score * 10) / 10,
+        confidence: t.confidence,
+        url: t.url
+      }));
 
     /* ---------- History/current-loop-in contacts ---------- */
-    // NOTE: we keep this simple: current ticket outgoing recipients minus requester/system/excludes,
-    // plus similar ticket recipients (top 5) if needed.
-    const historySet = new Map(); // email -> {score, ticketCount, sawCurrent}
+    const historySet = new Map(); // email -> {score, tickets, sawCurrent}
 
     function bump(email, points, sawCurrent, ticketRef) {
       const e = normalizeEmail(email);
@@ -434,10 +588,15 @@ app.get("/suggest", async (req, res) => {
     const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
     for (const e of currentLoopIns) bump(e, 50, true, ticketId);
 
-    const similarForContacts = ranked.slice(0, 5).map(t => t.id);
-    if (similarForContacts.length) {
+    // Use top 5 similar ticket IDs as evidence
+    const similarIdsForContacts = fullTickets
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5)
+      .map(t => t.id);
+
+    if (similarIdsForContacts.length) {
       const similarData = await Promise.all(
-        similarForContacts.map(async (id) => {
+        similarIdsForContacts.map(async (id) => {
           const [{ data: t }, { data: convsRaw }] = await Promise.all([
             fd.get(`/tickets/${id}`),
             fd.get(`/tickets/${id}/conversations`),
@@ -498,12 +657,13 @@ app.get("/suggest", async (req, res) => {
       ticketId,
       subject: ticket.subject,
       requesterEmail: requesterEmail || null, // debug; remove later if desired
+      firedRuleIds: currentRuleIds,
       similarTickets,
       ruleBasedLoopIns,
       suggestedExternalContacts: merged,
-      message: "Config-driven V1 ✅ (rules.json + excluded_emails.json)",
+      message: "Improved similarity ✅ (rule anchoring + recency + IDF-lite + phrases)",
       poolSize: pooled.length,
-      salesHelpCandidateCount: candidates.length,
+      salesHelpCandidateCount: candidates.length
     });
 
   } catch (err) {
@@ -516,7 +676,7 @@ app.get("/suggest", async (req, res) => {
     return res.status(status).json({
       error: err.message,
       freshdeskStatus: err.response?.status || null,
-      freshdeskData: err.response?.data || null,
+      freshdeskData: err.response?.data || null
     });
   }
 });

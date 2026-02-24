@@ -65,7 +65,7 @@ function addContactHit(map, email, points, reason, ticketId) {
       score: 0,
       reasons: {},
       tickets: new Set(),
-      flags: { sawTo: false, sawCc: false }
+      flags: { sawTo: false, sawCc: false, sawBcc: false }
     });
   }
   const obj = map.get(key);
@@ -74,6 +74,7 @@ function addContactHit(map, email, points, reason, ticketId) {
   if (ticketId != null) obj.tickets.add(String(ticketId));
   if (reason === "to_email") obj.flags.sawTo = true;
   if (reason === "cc_email") obj.flags.sawCc = true;
+  if (reason === "bcc_email") obj.flags.sawBcc = true;
 }
 
 /* ---------------- ENV ---------------- */
@@ -212,12 +213,12 @@ app.get("/suggest", async (req, res) => {
 
     const similarTickets = ranked.slice(0, 3);
 
-    /* ---------- B) Suggested External Contacts (0–2, strong-only, external = not Sales Help group) ---------- */
-    // NOTE: Because your /agents response doesn’t give group membership cleanly, we define “external”
-    // pragmatically: emails that show up as TO/CC on similar tickets (i.e., someone you looped in).
+    /* ---------- B) Suggested External Contacts (0–2) ---------- */
+    // Definition: someone you explicitly looped in (OUTGOING TO/CC/BCC) on similar tickets.
+    // Exclude requester/customer signals (incoming from_email/body).
+    // Exclude the Sales Help distro itself.
 
     const contactScores = new Map();
-
     const topSimilarIds = similarTickets.map(t => t.id);
 
     const similarData = await Promise.all(
@@ -233,7 +234,7 @@ app.get("/suggest", async (req, res) => {
     for (const item of similarData) {
       const t = item.ticket;
 
-      // Ticket-level CCs (strong loop-in signal)
+      // Ticket-level CCs (loop-in)
       const cc = Array.isArray(t.cc_emails) ? t.cc_emails : [];
       for (const e of cc) {
         const email = String(e || "").toLowerCase();
@@ -242,58 +243,45 @@ app.get("/suggest", async (req, res) => {
 
       const convs = Array.isArray(item.conversations) ? item.conversations : [];
       for (const conv of convs) {
-        // BEST: use explicit email fields if present
+        const incoming = conv?.incoming === true;
+
+        // Only count loop-ins on OUTGOING messages
+        if (incoming) continue;
+
         const toList = Array.isArray(conv?.to_emails) ? conv.to_emails : [];
         const ccList = Array.isArray(conv?.cc_emails) ? conv.cc_emails : [];
         const bccList = Array.isArray(conv?.bcc_emails) ? conv.bcc_emails : [];
-        const fromEmail = conv?.from_email ? String(conv.from_email).toLowerCase() : "";
 
         for (const e of toList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "to_email", item.id);
         for (const e of ccList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "cc_email", item.id);
         for (const e of bccList) addContactHit(contactScores, String(e || "").toLowerCase(), 6, "bcc_email", item.id);
-
-        // from_email can be useful when incoming (they replied)
-        const incoming = conv?.incoming === true;
-        if (fromEmail) addContactHit(contactScores, fromEmail, incoming ? 3 : 1, incoming ? "from_incoming" : "from_outgoing", item.id);
-
-        // fallback: parse body text
-        const body = conv?.body_text || stripHtml(conv?.body || "");
-        for (const email of extractEmailsFromText(body)) {
-          addContactHit(contactScores, email, incoming ? 2 : 1, incoming ? "inbound_body" : "body", item.id);
-        }
       }
     }
 
-    // Strong-only selection:
-    // - appears in 2+ similar tickets OR
-    // - was explicitly TO/CC/BCC on at least one similar ticket (loop-in signal) OR
-    // - score >= 8
+    // filter out your group mailbox if it appears
+    const SALES_HELP_INBOX = "saleshelp@scorpion.co"; // adjust if your actual distro differs
+
     const suggestedExternalContacts = Array.from(contactScores.values())
       .map(c => ({
         email: c.email,
         score: c.score,
         ticketCount: c.tickets.size,
-        sawTo: c.flags.sawTo,
-        sawCc: c.flags.sawCc,
+        sawLoopIn: (c.flags.sawTo || c.flags.sawCc || c.flags.sawBcc),
         reasons: c.reasons,
       }))
-      .filter(c => c.ticketCount >= 2 || c.sawTo || c.sawCc || c.score >= 8)
+      .filter(c => c.email !== SALES_HELP_INBOX)
+      // Strong-only: must be explicitly looped in at least once
+      .filter(c => c.sawLoopIn)
       .sort((a, b) => {
-        // prioritize loop-in signal, then multi-ticket, then score
-        const aLoop = (a.sawTo || a.sawCc) ? 1 : 0;
-        const bLoop = (b.sawTo || b.sawCc) ? 1 : 0;
-        if (bLoop !== aLoop) return bLoop - aLoop;
         if (b.ticketCount !== a.ticketCount) return b.ticketCount - a.ticketCount;
         return b.score - a.score;
       })
       .slice(0, 2)
       .map(c => ({
         email: c.email,
-        confidence:
-          (c.sawTo || c.sawCc) ? "High (explicitly looped in on similar ticket)" :
-          c.ticketCount >= 2 ? "High (seen across multiple similar tickets)" :
-          c.score >= 12 ? "High" :
-          "Medium",
+        confidence: c.ticketCount >= 2
+          ? "High (looped in across multiple similar tickets)"
+          : "High (explicitly looped in on a similar ticket)",
         evidence: { score: c.score, ticketCount: c.ticketCount, reasons: c.reasons },
       }));
 
@@ -302,7 +290,7 @@ app.get("/suggest", async (req, res) => {
       subject: ticket.subject,
       similarTickets,
       suggestedExternalContacts,
-      message: "A+B MVP ✅ (external contacts = loop-in emails on similar tickets)",
+      message: "A+B MVP ✅ (B only counts loop-ins on outgoing TO/CC/BCC)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length,
     });

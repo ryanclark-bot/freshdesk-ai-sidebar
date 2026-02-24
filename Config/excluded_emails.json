@@ -1,0 +1,21 @@
+{
+  "excluded_emails": [
+    "Tera.Lockwood@scorpion.co",
+    "Amanda.Wilcock@scorpion.co",
+    "Luke.Starmer@scorpion.co",
+    "shaniqua.capote@scorpion.co",
+    "Gabriella.Morris@scorpion.co",
+    "ryan.clark@scorpion.co",
+    "treska.mitchell@scorpion.co"
+  ],
+  "excluded_inboxes": [
+    "saleshelp@scorpion.co"
+  ],
+  "system_email_prefixes": [
+    "freshdesk",
+    "no-reply",
+    "noreply",
+    "notification",
+    "notifications"
+  ]
+}

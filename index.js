@@ -18,7 +18,6 @@ function readJson(filePath) {
   return JSON.parse(raw);
 }
 
-// Defaults (in case config files are missing/malformed)
 let RULES_CONFIG = { max_suggested_contacts: 2, rules: [] };
 let EXCLUSIONS_CONFIG = {
   excluded_emails: [],
@@ -46,29 +45,23 @@ const MAX_SUGGESTED_CONTACTS = Math.max(1, Number(RULES_CONFIG?.max_suggested_co
    SIMILARITY TUNING
    ========================= */
 
-// Prefer tickets updated within this many days
 const RECENT_DAYS = 180;
-
-// Hard downrank anything older than this (still allowed, but weak)
 const OLD_DAYS = 540;
-
-// How many candidates to rerank with full ticket fetch
 const RERANK_FETCH_LIMIT = 35;
-
-// How many to show
 const SIMILAR_TICKETS_TO_RETURN = 3;
 
-// Rule anchor bonus per shared rule
 const RULE_ANCHOR_BONUS = 18;
-
-// Phrase (bigram) bonus when matched
 const BIGRAM_BONUS = 6;
-
-// Recency bonus max
 const RECENCY_BONUS_MAX = 8;
 
-// Shared URL host bonus (ex: csx.scorpion.co)
 const SHARED_HOST_BONUS = 25;
+
+// If the current ticket has “strong anchors” (rule or URL host),
+// then DO NOT show unrelated tickets: penalize candidates that share neither
+const ANCHOR_MISS_PENALTY = 80;
+
+// Don’t return “similar” tickets below this score
+const MIN_SIMILAR_SCORE = 35;
 
 /* =========================
    HELPERS
@@ -103,7 +96,6 @@ function parseDateMs(s) {
   const ms = Date.parse(String(s || ""));
   return Number.isFinite(ms) ? ms : null;
 }
-
 function daysAgoFromIso(iso) {
   const ms = parseDateMs(iso);
   if (!ms) return null;
@@ -111,18 +103,15 @@ function daysAgoFromIso(iso) {
   return ageMs / (1000 * 60 * 60 * 24);
 }
 
-// Tokenize geared for support tickets (UPDATED stopwords)
+// Tokenize geared for support tickets (includes org-specific noise reducers)
 function tokenize(text) {
   const stop = new Set([
-    // general stopwords
     "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
     "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
     "would","will","just","please","thanks","thank",
 
-    // extra support fluff
     "help","urgent","update","issue","question","ticket","request","need","needed","asap",
 
-    // org-specific / very generic internal words (IMPORTANT)
     "team","hi","hello","regards",
     "scorpion","saleshelp","support",
     "client","clients","customer","customers",
@@ -176,12 +165,10 @@ function isSystemEmail(email) {
   const e = normalizeEmail(email);
   return SYSTEM_PREFIXES.some(prefix => e.startsWith(prefix));
 }
-
 function isExcluded(email) {
   const e = normalizeEmail(email);
   return EXCLUDED_EMAILS.has(e) || EXCLUDED_INBOXES.has(e) || isSystemEmail(e);
 }
-
 function isValidCandidateEmail(email, requesterEmail) {
   const e = normalizeEmail(email);
   const r = normalizeEmail(requesterEmail);
@@ -192,7 +179,7 @@ function isValidCandidateEmail(email, requesterEmail) {
 }
 
 /* =========================
-   RULE MATCHING (order-independent)
+   RULE MATCHING
    ========================= */
 
 function buildTokenSet(tokens) {
@@ -202,8 +189,8 @@ function buildTokenSet(tokens) {
 function itemMatches(textLower, tokenSet, item) {
   const p = String(item || "").toLowerCase().trim();
   if (!p) return false;
-  if (p.includes(" ")) return textLower.includes(p); // phrase
-  return tokenSet.has(p); // token
+  if (p.includes(" ")) return textLower.includes(p);
+  return tokenSet.has(p);
 }
 
 function groupMatches(textLower, tokenSet, group) {
@@ -284,12 +271,8 @@ const fd = axios.create({
   timeout: 20000,
 });
 
-/**
- * Freshdesk search quirk:
- * - query must be wrapped in quotes: query="status:2"
- * - page <= 10
- */
-async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
+// Freshdesk search quirk: query must be quoted; page <= 10
+async function searchTicketsPagedRawQuery(rawQuery, maxPagesRequested = 10) {
   const query = `"${rawQuery}"`;
   const all = [];
   const maxPages = Math.min(Math.max(1, Number(maxPagesRequested) || 1), 10);
@@ -301,6 +284,31 @@ async function searchTicketsPaged(rawQuery, maxPagesRequested = 10) {
     if (results.length === 0) break;
   }
   return all;
+}
+
+/**
+ * We prefer "group_id:<id>" ONLY (ignore status).
+ * If Freshdesk rejects the query, we fallback to union(status:2..5) and filter by group_id in code.
+ */
+async function getSalesHelpPoolTickets() {
+  // Primary: group-only search (ignore status)
+  try {
+    const groupOnly = await searchTicketsPagedRawQuery(`group_id:${SALES_HELP_GROUP_ID}`, 10);
+    return groupOnly;
+  } catch (err) {
+    const code = err?.response?.status;
+    const msg = err?.response?.data?.errors?.[0]?.message || err.message || "";
+    console.log("Group-only search failed, falling back to status union.", { status: code, msg });
+
+    // Fallback: statuses 2-5, then filter group_id in code
+    const [open, pending, resolved, closed] = await Promise.all([
+      searchTicketsPagedRawQuery("status:2", 10),
+      searchTicketsPagedRawQuery("status:3", 10),
+      searchTicketsPagedRawQuery("status:4", 10),
+      searchTicketsPagedRawQuery("status:5", 10),
+    ]);
+    return uniqById([...open, ...pending, ...resolved, ...closed]);
+  }
 }
 
 /* =========================
@@ -322,7 +330,7 @@ async function getRequesterEmail(ticket, conversationsMaybe) {
       const cEmail = normalizeEmail(data?.email);
       if (cEmail) return cEmail;
     } catch {
-      // ignore if not permitted
+      // ignore
     }
   }
 
@@ -367,9 +375,7 @@ function buildIdfMap(candidateDocsTokens) {
   const N = candidateDocsTokens.length || 1;
 
   for (const tokenSet of candidateDocsTokens) {
-    for (const tok of tokenSet) {
-      df.set(tok, (df.get(tok) || 0) + 1);
-    }
+    for (const tok of tokenSet) df.set(tok, (df.get(tok) || 0) + 1);
   }
 
   const idf = new Map();
@@ -444,7 +450,9 @@ app.get("/config", (req, res) => {
       RULE_ANCHOR_BONUS,
       BIGRAM_BONUS,
       RECENCY_BONUS_MAX,
-      SHARED_HOST_BONUS
+      SHARED_HOST_BONUS,
+      ANCHOR_MISS_PENALTY,
+      MIN_SIMILAR_SCORE
     }
   });
 });
@@ -478,28 +486,26 @@ app.get("/suggest", async (req, res) => {
     const currentBigrams = makeBigrams(tokenize(ticketTextLower));
     const currentHosts = extractUrlHosts(ticketText);
 
+    const hasStrongAnchor = currentRuleIds.length > 0 || currentHosts.size > 0;
+
     /* ---------- Rule-based loop-ins ---------- */
-    const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail)
-      .slice(0, MAX_SUGGESTED_CONTACTS);
+    const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail).slice(0, MAX_SUGGESTED_CONTACTS);
 
-    /* ---------- Similar tickets ---------- */
+    /* ---------- Similar tickets (group-based pool, ignore status) ---------- */
 
-    const [resolved, closed] = await Promise.all([
-      searchTicketsPaged("status:4", 10),
-      searchTicketsPaged("status:5", 10),
-    ]);
+    // Get pool ignoring status (primary: group_id search; fallback: status union)
+    const pooledRaw = await getSalesHelpPoolTickets();
 
-    const pooled = uniqById([...resolved, ...closed]);
+    // Always enforce group_id in code too (safety)
+    const pooled = uniqById(pooledRaw).filter(t => String(t.group_id) === SALES_HELP_GROUP_ID);
 
-    const candidates = pooled
-      .filter(t => String(t.group_id) === SALES_HELP_GROUP_ID)
-      .filter(t => String(t.id) !== ticketId);
+    const candidates = pooled.filter(t => String(t.id) !== ticketId);
 
-    // IDF map based on candidate subjects (cheap)
+    // IDF based on subject corpus (cheap + good enough)
     const candidateSubjectTokenSets = candidates.map(t => new Set(tokenize(t.subject || "")));
     const idfMap = buildIdfMap(candidateSubjectTokenSets);
 
-    // Pass 1: subject scoring + rule anchor + recency
+    // Pass 1: subject-only scoring + anchors + URL boost + recency + anchor-gating penalty
     const scoredPass1 = candidates.map(t => {
       const subj = String(t.subject || "");
       const subjLower = subj.toLowerCase();
@@ -515,27 +521,27 @@ app.get("/suggest", async (req, res) => {
       const candHosts = extractUrlHosts(subj);
       const hostBonus = sharedHostBonus(currentHosts, candHosts);
 
-      const score = base + bigram + rec + ruleBonus + hostBonus;
+      const sharesAnchor =
+        (currentRuleIds.length > 0 && ruleBonus > 0) ||
+        (currentHosts.size > 0 && hostBonus > 0);
 
-      return {
-        id: t.id,
-        subject: t.subject || "",
-        updated_at: t.updated_at || t.created_at || null,
-        score1: score
-      };
+      const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
+
+      const score1 = base + bigram + rec + ruleBonus + hostBonus + anchorPenalty;
+
+      return { id: t.id, subject: t.subject || "", updated_at: t.updated_at || t.created_at || null, score1 };
     });
 
     const topForFetch = scoredPass1
       .sort((a, b) => b.score1 - a.score1)
       .slice(0, RERANK_FETCH_LIMIT);
 
-    // Pass 2: full ticket fetch rerank
-    const fullTickets = await Promise.all(
+    // Pass 2: fetch full ticket text for rerank
+    const reranked = await Promise.all(
       topForFetch.map(async (t) => {
         try {
           const { data } = await fd.get(`/tickets/${t.id}`);
-          const fullText =
-            `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
+          const fullText = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
           const fullLower = fullText.toLowerCase();
 
           const candTokenSet = new Set(tokenize(fullLower));
@@ -549,7 +555,13 @@ app.get("/suggest", async (req, res) => {
           const candHosts = extractUrlHosts(fullText);
           const hostBonus = sharedHostBonus(currentHosts, candHosts);
 
-          const score = base + bigram + rec + ruleBonus + hostBonus;
+          const sharesAnchor =
+            (currentRuleIds.length > 0 && ruleBonus > 0) ||
+            (currentHosts.size > 0 && hostBonus > 0);
+
+          const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
+
+          const score = base + bigram + rec + ruleBonus + hostBonus + anchorPenalty;
 
           return {
             id: t.id,
@@ -571,8 +583,9 @@ app.get("/suggest", async (req, res) => {
       })
     );
 
-    const similarTickets = fullTickets
+    const similarTickets = reranked
       .sort((a, b) => b.score - a.score)
+      .filter(t => t.score >= MIN_SIMILAR_SCORE)
       .slice(0, SIMILAR_TICKETS_TO_RETURN)
       .map(t => ({
         id: t.id,
@@ -598,7 +611,8 @@ app.get("/suggest", async (req, res) => {
     const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
     for (const e of currentLoopIns) bump(e, 50, true, ticketId);
 
-    const similarIdsForContacts = fullTickets
+    // Use top reranked IDs as evidence
+    const similarIdsForContacts = reranked
       .sort((a, b) => b.score - a.score)
       .slice(0, 5)
       .map(t => t.id);
@@ -627,7 +641,7 @@ app.get("/suggest", async (req, res) => {
         email: o.email,
         score: o.score,
         ticketCount: o.tickets.size,
-        sawCurrent: o.sawCurrent,
+        sawCurrent: o.sawCurrent
       }))
       .sort((a, b) => {
         const aCur = a.sawCurrent ? 1 : 0;
@@ -670,11 +684,10 @@ app.get("/suggest", async (req, res) => {
       similarTickets,
       ruleBasedLoopIns,
       suggestedExternalContacts: merged,
-      message: "Similarity improved ✅ (rule anchoring + recency + IDF-lite + phrases + URL host boost)",
+      message: "Similarity ✅ (ignore status; group-based pool + anchor-gating + URL host boost)",
       poolSize: pooled.length,
       salesHelpCandidateCount: candidates.length
     });
-
   } catch (err) {
     console.error("Suggest error:", err.message);
     if (err.response) {

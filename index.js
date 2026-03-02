@@ -601,9 +601,17 @@ app.get("/suggest", async (req, res) => {
         if (!seen.has(h.email)) { seen.add(h.email); merged.push({ email: h.email, confidence: h.confidence, source: "history" }); }
       }
 
+      // ✅ APPEND: tags + placeholders for new UI sections
+      const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
+      const helpfulLinks = [];
+      const processNotes = [];
+
       return {
         ticketId,
         subject: ticket.subject,
+        tags,                 // ✅ used for "⚠ No tags applied"
+        helpfulLinks,         // ✅ new section (currently empty)
+        processNotes,         // ✅ new section (currently empty)
         firedRuleIds: currentRuleIds,
         similarTickets,
         suggestedExternalContacts: merged,

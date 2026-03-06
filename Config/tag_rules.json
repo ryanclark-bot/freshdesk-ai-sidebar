@@ -1,0 +1,299 @@
+[
+  {
+    "tag": "Account Reassignment",
+    "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": [],
+    "notes": "Review account info, activity and territory before reassigning"
+  },
+  {
+    "tag": "Account Setup",
+    "keywords": ["New Account", "New Acct", "Add to Salesforce", "Add to SF"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": [],
+    "notes": "Thorough de-dupe before adding new account"
+  },
+  {
+    "tag": "Ad Incentive",
+    "keywords": ["Ad form", "Ad incentive", "Ad discount"],
+    "handledBy": "Amanda",
+    "helpfulLinks": ["https://forms.gle/bn5dMQGmh69XJGkF6"],
+    "notes": "Make sure it's acive for current month and share link with seller"
+  },
+  {
+    "tag": "Affiliate Program",
+    "keywords": ["Affiliate"],
+    "handledBy": "",
+    "helpfulLinks": ["https://scorpion.seismic.com/Link/Content/DCF4cJfg7MqMH8QQg7d6B9q2b9m3"],
+    "notes": ""
+  },
+  {
+    "tag": "AHREFS Credits",
+    "keywords": ["AHREFS", "ahref"],
+    "handledBy": "Gabi, Tera or Luke",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Call Tracking",
+    "keywords": ["Call logging", "call activity", "calls not showing"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": [],
+    "notes": "Review activity, confirm user profile is set correctly"
+  },
+  {
+    "tag": "Canceled Client Review",
+    "keywords": ["Returning Client", "Canceled", "Cancelled", "Canceled Client", "Cancelled Client", "Former Client", "Bad Debt"],
+    "handledBy": "Billing, AM from CSX",
+    "helpfulLinks": [],
+    "notes": "Loop in billing based on business type"
+  },
+  {
+    "tag": "Chili Piper",
+    "keywords": ["Chili", "CP", "Chilipiper", "Booking Link", "Meeting Link", "Chili Cal", "Chili Calendar"],
+    "handledBy": "CP Admins: Luke, Amanda?",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "CSX User Error",
+    "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact"],
+    "handledBy": "Product Support",
+    "helpfulLinks": [],
+    "notes": "Create child ticket. DO NOT add PS onto the email in freshdesk."
+  },
+  {
+    "tag": "delete contact",
+    "keywords": ["Contact removal", "Delete contact", "Delete person", "Delete employee", "Delete lawyer"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": [],
+    "notes": "Review and make sure the data is wrong/should be deleted"
+  },
+  {
+    "tag": "Duplicates/Merged",
+    "keywords": ["Duplicates", "Dupes", "Merge", "Combine", "Merger", "Acquired", "Bought out"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": [],
+    "notes": "Review account info, CSX data, activity before merging"
+  },
+  {
+    "tag": "Enablement Question",
+    "keywords": ["Training Question", "Enablement"],
+    "handledBy": "Sales Enablement",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Global Support",
+    "keywords": ["Webmax support", "global support", "webmax AM", "global support AM", "GS AM"],
+    "handledBy": "scorpion@scorpion.co",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Growth Advisor/Deal Builder",
+    "keywords": ["Growth Advisor", "Deal Builder", "GA", "CSX Deal", "CS Deal", "Line Item"],
+    "handledBy": "",
+    "helpfulLinks": ["https://scorpion.seismic.com/Link/Content/DCjqj7QG7XFGRGHG4T2pfVVchGbj"],
+    "notes": ""
+  },
+  {
+    "tag": "ICP Fit",
+    "keywords": ["ICP", "is this a fit", "do they fit", "can i sell", "do we work with"],
+    "handledBy": "",
+    "helpfulLinks": ["https://www.salesanddeliveryresources.com/"],
+    "notes": "Review business type/size and determine whether it fits our ICP"
+  },
+  {
+    "tag": "Lead Convert",
+    "keywords": ["Lead Convert", "Convert Contact", "Convert Lead", "Contact Convert"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Meeting Disposition Error, Meeting Disposition Update",
+    "keywords": ["Dispo", "Disposition", "Meeting Error", "Meeting Complete", "Meeting Attribution"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "opportunity creation",
+    "keywords": ["New Opp", "New Opportunity", "Need Opp", "Need Opportunity", "Build Opp", "Build Opportunity", "Create Opp", "Create Opportunity"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Opportunity Stage Correction",
+    "keywords": ["Re-open Opp", "Reopen opp", "Opportunity stage", "Stage correct", "Change close lost", "change lost opp"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Outlook",
+    "keywords": ["Outlook", "email issues"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Outreach",
+    "keywords": ["Outreach", "Sequences", "Activate Sequence", "Activate Cadences", "Email Templates", "Snippets"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Record Deletion",
+    "keywords": ["Delete", "Delete Record", "Delete Account", "Delete Contact", "Delete Opp", "Delete Opportunity"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Record Reassignment",
+    "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct", "put in name"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "References",
+    "keywords": ["Existing Clients", "References", "Referrals", "Client Examples", "HVAC examples", "Roofing Examples", "Legal Examples"],
+    "handledBy": "",
+    "helpfulLinks": ["https://scorpion.lightning.force.com/lightning/r/Report/00ORj000005qpmjMAA/view?queryScope=userFolders"],
+    "notes": ""
+  },
+  {
+    "tag": "Referrals",
+    "keywords": ["Referrals"],
+    "handledBy": "",
+    "helpfulLinks": [
+      "https://scorpion.seismic.com/Link/Content/DCjWP4gcbfMHMGCC7DQMDC4PCRhd",
+      "https://scorpion.seismic.com/Link/Content/DC6hjRVdCFDXM87H44TcPM94m8Pd"
+    ],
+    "notes": "*differentiate these from References."
+  },
+  {
+    "tag": "Replacement Deal",
+    "keywords": ["Changes to agreement", "changes to deal", "Replace Deal", "Need new deal", "new deal", "new contract", "contract replacement", "new services", "update ad spend", "update services", "update monthly", "fix deal", "deal fix"],
+    "handledBy": "",
+    "helpfulLinks": ["https://scorpion.seismic.com/Link/Content/DCccgRgBf94C78cHmdXVR2XmpFmj"],
+    "notes": ""
+  },
+  {
+    "tag": "Reporting",
+    "keywords": ["Report", "Reports", "Reporting"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Sales Engagements/Cadences",
+    "keywords": ["Cadences", "Sequences", "Engagements", "Templates", "Work Queue"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Sales Transfer Notes",
+    "keywords": ["Transfer Notes", "Welcome Call Notes", "Onboarding Notes"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Sales Transfer Times",
+    "keywords": ["Transfer Times", "Welcome Call Times", "Onboarding Times", "No Times", "Times Not Showing", "Can't Schedule Welcome", "Can't schedule transfer", "No times Available"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Salesforce Record Update",
+    "keywords": ["Update record", "Record update", "Contact Update", "Update Contact", "Update Account", "Account Update", "SF Update", "Salesforce Update", "Update SF", "Update Salesforce"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Salesforce User Error, Salesforce Bug",
+    "keywords": ["SF Error", "SF Not Working", "SF issue", "Salesforce Error", "Salesforce Not working", "Salesforce Issue"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Scorpion Convert",
+    "keywords": ["Scorpion Convert"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Seismic",
+    "keywords": ["Seismic", "One-sheeter", "Document", "Doc"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Service Desk",
+    "keywords": ["Signature", "Email Signature", "Phone Signature", "Zoom"],
+    "handledBy": "ServiceDesk@scorpion.co",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Setup Fee/Contract Adjustment",
+    "keywords": ["Reduce", "setup fee", "set-up fee", "adjust price", "adjust pricing", "udpate pricing", "discount"],
+    "handledBy": "",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "SPIFF/Compensation",
+    "keywords": ["Commission", "Spiff"],
+    "handledBy": "Amanda",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "upsell",
+    "keywords": ["Upgrade", "upsell", "addon", "add-on", "add service"],
+    "handledBy": "",
+    "helpfulLinks": ["https://scorpion.seismic.com/app?ContentId=f0480d07-6693-4136-8804-2d1a8c42589b"],
+    "notes": ""
+  },
+  {
+    "tag": "Vertical/Business Type Fit",
+    "keywords": ["BT Fit", "do we work with", "vertical", "business type", "BT", "is this a fit", "are they a fit"],
+    "handledBy": "",
+    "helpfulLinks": ["https://www.salesanddeliveryresources.com/"],
+    "notes": ""
+  },
+  {
+    "tag": "Video Packages",
+    "keywords": ["Video"],
+    "handledBy": "Jeremy Buck",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Welcome Call",
+    "keywords": ["Kick off", "kickoff", "onboarding", "welcome call", "sales transfer"],
+    "handledBy": "Alyssa Lapp",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "6in6",
+    "keywords": ["6in6", "6x6", "6 in 6", "6 x 6", "6&6", "6 and 6", "6and6"],
+    "handledBy": "Nate Reynolds",
+    "helpfulLinks": [],
+    "notes": ""
+  }
+]

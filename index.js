@@ -531,6 +531,49 @@ function to429Error(err) {
   return { retryAfter };
 }
 
+function hasMappedTag(ticketTags) {
+  return !!findMappedTagRule(ticketTags);
+}
+
+async function findRecentSameTagTickets(currentTicketId, mappedTag, freshdeskDomain) {
+  const pool = await getSalesHelpPoolTicketsCached();
+
+  const candidates = pool
+    .filter(t => String(t.id) !== String(currentTicketId))
+    .sort((a, b) => {
+      const aMs = parseDateMs(a.updated_at || a.created_at) || 0;
+      const bMs = parseDateMs(b.updated_at || b.created_at) || 0;
+      return bMs - aMs;
+    });
+
+  const out = [];
+  const mappedTagNorm = normalizeLoose(mappedTag);
+
+  for (const t of candidates) {
+    if (out.length >= SIMILAR_TICKETS_TO_RETURN) break;
+
+    try {
+      const { data } = await fd.get(`/tickets/${t.id}`);
+      const ticketTags = Array.isArray(data?.tags) ? data.tags : [];
+      const tagNorms = new Set(ticketTags.map(normalizeLoose));
+
+      if (!tagNorms.has(mappedTagNorm)) continue;
+
+      out.push({
+        id: data.id,
+        subject: data.subject || "",
+        score: null,
+        confidence: "Same tag",
+        url: `${freshdeskDomain}/a/tickets/${data.id}`
+      });
+    } catch {
+      // skip quietly
+    }
+  }
+
+  return out;
+}
+
 /* =========================
    ROUTES
    ========================= */
@@ -594,6 +637,8 @@ app.get("/suggest", async (req, res) => {
          STRICT TAG MODE
          ------------------------- */
       if (hierarchy.matchMode === "tag") {
+        const sameTagTickets = await findRecentSameTagTickets(ticketId, hierarchy.matchedTag, freshdeskDomain);
+
         return {
           ticketId,
           subject: ticket.subject,
@@ -606,9 +651,9 @@ app.get("/suggest", async (req, res) => {
           processNotes: hierarchy.processNotes,
           hierarchyConfidence: hierarchy.hierarchyConfidence,
           firedRuleIds: [],
-          similarTickets: [],
+          similarTickets: sameTagTickets,
           suggestedExternalContacts: [],
-          message: "Tag mode ✅ (strict)"
+          message: "Tag mode ✅ (strict + same-tag recent tickets)"
         };
       }
 
@@ -751,7 +796,6 @@ app.get("/suggest", async (req, res) => {
       const merged = [];
       const seen = new Set();
 
-      // In keyword mode, use hierarchy handledBy first if present
       if (hierarchy.matchMode === "keyword" && hierarchy.handledBy) {
         merged.push({
           email: hierarchy.handledBy,
@@ -761,7 +805,6 @@ app.get("/suggest", async (req, res) => {
         seen.add(hierarchy.handledBy);
       }
 
-      // Only use legacy fallbacks when not in strict tag mode (we already returned above)
       for (const r of ruleBasedLoopIns) {
         if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
         if (!seen.has(r.email)) {

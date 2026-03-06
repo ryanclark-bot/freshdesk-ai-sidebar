@@ -198,7 +198,9 @@ function recencyBonus(updatedAtIso) {
 
 const EXCLUDED_EMAILS = new Set((EXCLUSIONS_CONFIG?.excluded_emails || []).map(normalizeEmail));
 const EXCLUDED_INBOXES = new Set((EXCLUSIONS_CONFIG?.excluded_inboxes || []).map(normalizeEmail));
-const SYSTEM_PREFIXES = (EXCLUSIONS_CONFIG?.system_email_prefixes || []).map(s => String(s || "").toLowerCase()).filter(Boolean);
+const SYSTEM_PREFIXES = (EXCLUSIONS_CONFIG?.system_email_prefixes || [])
+  .map(s => String(s || "").toLowerCase())
+  .filter(Boolean);
 
 function isSystemEmail(email) {
   const e = normalizeEmail(email);
@@ -218,7 +220,7 @@ function isValidCandidateEmail(email, requesterEmail) {
 }
 
 /* =========================
-   RULE MATCHING
+   LEGACY RULE MATCHING
    ========================= */
 
 function buildTokenSet(tokens) {
@@ -582,17 +584,43 @@ app.get("/suggest", async (req, res) => {
       }
 
       const requesterEmail = await getRequesterEmail(ticket, currentConvs);
-
       const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
       const ticketTextLower = ticketText.toLowerCase();
+
+      const hierarchy = buildHierarchyPayload(ticket, ticketText);
+      const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
+
+      /* -------------------------
+         STRICT TAG MODE
+         ------------------------- */
+      if (hierarchy.matchMode === "tag") {
+        return {
+          ticketId,
+          subject: ticket.subject,
+          tags,
+          matchMode: hierarchy.matchMode,
+          matchedTag: hierarchy.matchedTag,
+          suggestedTags: [],
+          handledBy: hierarchy.handledBy,
+          helpfulLinks: hierarchy.helpfulLinks,
+          processNotes: hierarchy.processNotes,
+          hierarchyConfidence: hierarchy.hierarchyConfidence,
+          firedRuleIds: [],
+          similarTickets: [],
+          suggestedExternalContacts: [],
+          message: "Tag mode ✅ (strict)"
+        };
+      }
+
+      /* -------------------------
+         NO-TAG MODES
+         ------------------------- */
 
       const currentRuleIds = firedRuleIds(ticketTextLower);
       const currentTokenSet = new Set(tokenize(ticketTextLower));
       const currentBigrams = makeBigrams(tokenize(ticketTextLower));
       const currentHosts = extractUrlHosts(ticketText);
       const hasStrongAnchor = currentRuleIds.length > 0 || currentHosts.size > 0;
-
-      const hierarchy = buildHierarchyPayload(ticket, ticketText);
 
       const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail).slice(0, MAX_SUGGESTED_CONTACTS);
 
@@ -650,9 +678,21 @@ app.get("/suggest", async (req, res) => {
           const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
           const score = base + bigram + rec + ruleBonus + hostBonus + anchorPenalty;
 
-          return { id: t.id, subject: data.subject || t.subject, score, confidence: confidenceLabel(score), url: `${freshdeskDomain}/a/tickets/${t.id}` };
+          return {
+            id: t.id,
+            subject: data.subject || t.subject,
+            score,
+            confidence: confidenceLabel(score),
+            url: `${freshdeskDomain}/a/tickets/${t.id}`
+          };
         } catch {
-          return { id: t.id, subject: t.subject, score: t.score1, confidence: confidenceLabel(t.score1), url: `${freshdeskDomain}/a/tickets/${t.id}` };
+          return {
+            id: t.id,
+            subject: t.subject,
+            score: t.score1,
+            confidence: confidenceLabel(t.score1),
+            url: `${freshdeskDomain}/a/tickets/${t.id}`
+          };
         }
       }));
 
@@ -703,30 +743,40 @@ app.get("/suggest", async (req, res) => {
           return b.score - a.score;
         })
         .slice(0, MAX_SUGGESTED_CONTACTS)
-        .map(o => ({ email: o.email, confidence: o.sawCurrent ? "High (added on this ticket)" : "High (seen on similar tickets)" }));
+        .map(o => ({
+          email: o.email,
+          confidence: o.sawCurrent ? "High (added on this ticket)" : "High (seen on similar tickets)"
+        }));
 
       const merged = [];
       const seen = new Set();
 
-      if (hierarchy.handledBy) {
+      // In keyword mode, use hierarchy handledBy first if present
+      if (hierarchy.matchMode === "keyword" && hierarchy.handledBy) {
         merged.push({
           email: hierarchy.handledBy,
-          confidence: hierarchy.matchMode === "tag" ? "High (mapped tag)" : "High (keyword match)",
-          source: hierarchy.matchMode
+          confidence: "High (keyword match)",
+          source: "keyword"
         });
         seen.add(hierarchy.handledBy);
       }
 
+      // Only use legacy fallbacks when not in strict tag mode (we already returned above)
       for (const r of ruleBasedLoopIns) {
         if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
-        if (!seen.has(r.email)) { seen.add(r.email); merged.push({ email: r.email, confidence: r.confidence, source: "rule" }); }
-      }
-      for (const h of historyBased) {
-        if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
-        if (!seen.has(h.email)) { seen.add(h.email); merged.push({ email: h.email, confidence: h.confidence, source: "history" }); }
+        if (!seen.has(r.email)) {
+          seen.add(r.email);
+          merged.push({ email: r.email, confidence: r.confidence, source: "rule" });
+        }
       }
 
-      const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
+      for (const h of historyBased) {
+        if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
+        if (!seen.has(h.email)) {
+          seen.add(h.email);
+          merged.push({ email: h.email, confidence: h.confidence, source: "history" });
+        }
+      }
 
       return {
         ticketId,
@@ -742,11 +792,9 @@ app.get("/suggest", async (req, res) => {
         firedRuleIds: currentRuleIds,
         similarTickets,
         suggestedExternalContacts: merged,
-        message: hierarchy.matchMode === "tag"
-          ? "Tag mode ✅"
-          : hierarchy.matchMode === "keyword"
-            ? "Keyword mode ✅"
-            : "Fallback mode ✅"
+        message: hierarchy.matchMode === "keyword"
+          ? "Keyword mode ✅"
+          : "Fallback mode ✅"
       };
     } catch (err) {
       throw err;

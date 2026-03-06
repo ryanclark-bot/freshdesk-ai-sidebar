@@ -24,6 +24,7 @@ let EXCLUSIONS_CONFIG = {
   excluded_inboxes: ["saleshelp@scorpion.co"],
   system_email_prefixes: ["freshdesk", "no-reply", "noreply", "notification", "notifications"],
 };
+let TAG_RULES_CONFIG = [];
 
 try {
   RULES_CONFIG = readJson("config/rules.json");
@@ -39,6 +40,13 @@ try {
   console.log("WARNING: Could not load config/excluded_emails.json; using defaults:", e.message);
 }
 
+try {
+  TAG_RULES_CONFIG = readJson("config/tag_rules.json");
+  console.log("Loaded config/tag_rules.json");
+} catch (e) {
+  console.log("WARNING: Could not load config/tag_rules.json; using empty tag rules:", e.message);
+}
+
 const MAX_SUGGESTED_CONTACTS = Math.max(1, Number(RULES_CONFIG?.max_suggested_contacts || 2));
 
 /* =========================
@@ -47,7 +55,7 @@ const MAX_SUGGESTED_CONTACTS = Math.max(1, Number(RULES_CONFIG?.max_suggested_co
 
 const RECENT_DAYS = 180;
 const OLD_DAYS = 540;
-const RERANK_FETCH_LIMIT = 25; // reduced to lower Freshdesk load
+const RERANK_FETCH_LIMIT = 25;
 const SIMILAR_TICKETS_TO_RETURN = 3;
 
 const RULE_ANCHOR_BONUS = 18;
@@ -59,18 +67,16 @@ const ANCHOR_MISS_PENALTY = 80;
 const MIN_SIMILAR_SCORE = 35;
 
 /* =========================
-   CACHES (to prevent 429)
+   CACHES
    ========================= */
 
-// Cache Sales Help pool (search results) for 10 minutes
 const POOL_CACHE_TTL_MS = 10 * 60 * 1000;
 let poolCache = { ts: 0, tickets: [] };
 let poolInFlight = null;
 
-// Cache /suggest response per ticket for 30 seconds
 const SUGGEST_CACHE_TTL_MS = 30 * 1000;
-const suggestCache = new Map(); // ticketId -> {ts, data}
-const suggestInFlight = new Map(); // ticketId -> Promise
+const suggestCache = new Map();
+const suggestInFlight = new Map();
 
 /* =========================
    HELPERS
@@ -100,7 +106,6 @@ function confidenceLabel(score) {
   if (score >= 35) return "Possible";
   return "Low";
 }
-
 function parseDateMs(s) {
   const ms = Date.parse(String(s || ""));
   return Number.isFinite(ms) ? ms : null;
@@ -111,15 +116,12 @@ function daysAgoFromIso(iso) {
   const ageMs = Date.now() - ms;
   return ageMs / (1000 * 60 * 60 * 24);
 }
-
 function tokenize(text) {
   const stop = new Set([
     "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
     "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
     "would","will","just","please","thanks","thank",
-
     "help","urgent","update","issue","question","ticket","request","need","needed","asap",
-
     "team","hi","hello","regards",
     "scorpion","saleshelp","support",
     "client","clients","customer","customers",
@@ -132,13 +134,11 @@ function tokenize(text) {
     .split(/[^a-z0-9]+/g)
     .filter(w => w && w.length >= 2 && !stop.has(w));
 }
-
 function makeBigrams(tokens) {
   const out = new Set();
   for (let i = 0; i < tokens.length - 1; i++) out.add(`${tokens[i]} ${tokens[i + 1]}`);
   return out;
 }
-
 function extractUrlHosts(text) {
   const hosts = new Set();
   const s = String(text || "");
@@ -147,14 +147,12 @@ function extractUrlHosts(text) {
   while ((m = re.exec(s))) hosts.add(m[1].toLowerCase());
   return hosts;
 }
-
 function sharedHostBonus(currentHosts, candidateHosts) {
   if (!currentHosts.size || !candidateHosts.size) return 0;
   let shared = 0;
   for (const h of currentHosts) if (candidateHosts.has(h)) shared++;
   return shared * SHARED_HOST_BONUS;
 }
-
 function buildIdfMap(candidateDocsTokens) {
   const df = new Map();
   const N = candidateDocsTokens.length || 1;
@@ -167,7 +165,6 @@ function buildIdfMap(candidateDocsTokens) {
   }
   return idf;
 }
-
 function overlapScoreIdf(currentTokenSet, candidateTokenSet, idfMap) {
   let score = 0;
   for (const tok of candidateTokenSet) {
@@ -176,13 +173,11 @@ function overlapScoreIdf(currentTokenSet, candidateTokenSet, idfMap) {
   }
   return score;
 }
-
 function bigramBonus(currentBigrams, candidateTextLower) {
   let bonus = 0;
   for (const bg of currentBigrams) if (candidateTextLower.includes(bg)) bonus += BIGRAM_BONUS;
   return bonus;
 }
-
 function recencyBonus(updatedAtIso) {
   const ageDays = daysAgoFromIso(updatedAtIso);
   if (ageDays == null) return 0;
@@ -290,6 +285,132 @@ function buildRuleSuggestions(ticketTextLower, requesterEmail) {
 }
 
 /* =========================
+   TAG / KEYWORD HIERARCHY HELPERS
+   ========================= */
+
+function normalizeLoose(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function prepareTagRules(rules) {
+  return (rules || []).map((r, idx) => ({
+    priority: idx,
+    tag: String(r.tag || "").trim(),
+    tagNorm: normalizeLoose(r.tag || ""),
+    keywords: Array.isArray(r.keywords) ? r.keywords.filter(Boolean) : [],
+    keywordsNorm: Array.isArray(r.keywords) ? r.keywords.map(k => normalizeLoose(k)).filter(Boolean) : [],
+    handledBy: String(r.handledBy || "").trim(),
+    helpfulLinks: Array.isArray(r.helpfulLinks) ? r.helpfulLinks.filter(Boolean) : [],
+    notes: String(r.notes || "").trim()
+  })).filter(r => r.tag);
+}
+
+const TAG_RULES = prepareTagRules(TAG_RULES_CONFIG);
+
+function findMappedTagRule(ticketTags) {
+  const tagNorms = new Set((ticketTags || []).map(t => normalizeLoose(t)).filter(Boolean));
+  if (!tagNorms.size) return null;
+
+  for (const rule of TAG_RULES) {
+    if (tagNorms.has(rule.tagNorm)) return rule;
+  }
+  return null;
+}
+
+function scoreKeywordRule(rule, textNorm) {
+  let score = 0;
+  let matchedKeywords = [];
+
+  for (const kw of rule.keywordsNorm) {
+    if (!kw) continue;
+
+    if (textNorm.includes(kw)) {
+      score += kw.split(" ").length > 1 ? 12 : 8;
+      matchedKeywords.push(kw);
+      continue;
+    }
+
+    const parts = kw.split(" ").filter(Boolean);
+    if (parts.length > 1 && parts.every(p => textNorm.includes(p))) {
+      score += 6;
+      matchedKeywords.push(kw);
+    }
+  }
+
+  return { score, matchedKeywords };
+}
+
+function findKeywordMatches(text) {
+  const textNorm = normalizeLoose(text);
+  const matches = [];
+
+  for (const rule of TAG_RULES) {
+    const { score, matchedKeywords } = scoreKeywordRule(rule, textNorm);
+    if (score > 0) {
+      matches.push({
+        rule,
+        score,
+        matchedKeywords
+      });
+    }
+  }
+
+  matches.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.rule.priority - b.rule.priority;
+  });
+
+  return matches;
+}
+
+function buildHierarchyPayload(ticket, ticketText) {
+  const ticketTags = Array.isArray(ticket?.tags) ? ticket.tags : [];
+  const mappedTagRule = findMappedTagRule(ticketTags);
+
+  if (mappedTagRule) {
+    return {
+      matchMode: "tag",
+      matchedTag: mappedTagRule.tag,
+      suggestedTags: [],
+      handledBy: mappedTagRule.handledBy || "",
+      helpfulLinks: mappedTagRule.helpfulLinks.map(url => ({ label: url, url })),
+      processNotes: mappedTagRule.notes ? [mappedTagRule.notes] : [],
+      hierarchyConfidence: "High (mapped tag)"
+    };
+  }
+
+  const keywordMatches = findKeywordMatches(ticketText);
+  const best = keywordMatches[0] || null;
+  const suggestedTags = keywordMatches.slice(0, 2).map(m => m.rule.tag);
+
+  if (best) {
+    return {
+      matchMode: "keyword",
+      matchedTag: best.rule.tag,
+      suggestedTags,
+      handledBy: best.rule.handledBy || "",
+      helpfulLinks: best.rule.helpfulLinks.map(url => ({ label: url, url })),
+      processNotes: best.rule.notes ? [best.rule.notes] : [],
+      hierarchyConfidence: best.score >= 20 ? "High (keyword match)" : "Possible (keyword match)"
+    };
+  }
+
+  return {
+    matchMode: "fallback",
+    matchedTag: null,
+    suggestedTags: [],
+    handledBy: "",
+    helpfulLinks: [],
+    processNotes: [],
+    hierarchyConfidence: "No hierarchy match"
+  };
+}
+
+/* =========================
    FRESHDESK SETUP
    ========================= */
 
@@ -305,6 +426,7 @@ console.log("Freshdesk baseURL:", JSON.stringify(baseURL));
 console.log("SALES_HELP_GROUP_ID:", JSON.stringify(SALES_HELP_GROUP_ID));
 console.log("Has FRESHDESK_API_KEY:", Boolean(FRESHDESK_API_KEY));
 console.log("Loaded rules:", (RULES_CONFIG?.rules || []).length);
+console.log("Loaded tag rules:", TAG_RULES.length);
 
 const fd = axios.create({
   baseURL,
@@ -312,7 +434,6 @@ const fd = axios.create({
   timeout: 20000,
 });
 
-// Quoted query, page <= 10
 async function searchTicketsPagedRawQuery(rawQuery, maxPagesRequested = 10) {
   const query = `"${rawQuery}"`;
   const all = [];
@@ -335,13 +456,11 @@ async function getSalesHelpPoolTicketsCached() {
 
   poolInFlight = (async () => {
     try {
-      // Primary: group-only search
       const groupOnly = await searchTicketsPagedRawQuery(`group_id:${SALES_HELP_GROUP_ID}`, 10);
       const tickets = uniqById(groupOnly).filter(t => String(t.group_id) === SALES_HELP_GROUP_ID);
       poolCache = { ts: Date.now(), tickets };
       return tickets;
     } catch (err) {
-      // Fallback: statuses 2-5 union then filter group in code
       const [s2, s3, s4, s5] = await Promise.all([
         searchTicketsPagedRawQuery("status:2", 10),
         searchTicketsPagedRawQuery("status:3", 10),
@@ -423,6 +542,7 @@ app.get("/config", (req, res) => {
   }
   return res.json({
     rules_loaded: (RULES_CONFIG?.rules || []).map(r => r.id),
+    tag_rules_loaded: TAG_RULES.map(r => r.tag),
     cache: { POOL_CACHE_TTL_MS, SUGGEST_CACHE_TTL_MS }
   });
 });
@@ -435,11 +555,9 @@ app.get("/suggest", async (req, res) => {
   if (!FRESHDESK_API_KEY) return res.status(500).send("Server misconfigured: missing FRESHDESK_API_KEY");
   if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
 
-  // suggest cache
   const cached = suggestCache.get(ticketId);
   if (cached && (Date.now() - cached.ts) < SUGGEST_CACHE_TTL_MS) return res.json(cached.data);
 
-  // coalesce in-flight
   if (suggestInFlight.has(ticketId)) {
     try {
       const data = await suggestInFlight.get(ticketId);
@@ -474,15 +592,15 @@ app.get("/suggest", async (req, res) => {
       const currentHosts = extractUrlHosts(ticketText);
       const hasStrongAnchor = currentRuleIds.length > 0 || currentHosts.size > 0;
 
+      const hierarchy = buildHierarchyPayload(ticket, ticketText);
+
       const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail).slice(0, MAX_SUGGESTED_CONTACTS);
 
-      // Pool (cached)
       const pooled = await getSalesHelpPoolTicketsCached();
       const candidates = pooled.filter(t => String(t.id) !== ticketId);
 
       const idfMap = buildIdfMap(candidates.map(t => new Set(tokenize(t.subject || ""))));
 
-      // pass1 score
       const pass1 = candidates.map(t => {
         const subjLower = String(t.subject || "").toLowerCase();
         const candTokenSet = new Set(tokenize(subjLower));
@@ -550,7 +668,6 @@ app.get("/suggest", async (req, res) => {
           url: t.url
         }));
 
-      // external contacts (history + current)
       const historySet = new Map();
       function bump(email, points, sawCurrent) {
         const e = normalizeEmail(email);
@@ -564,7 +681,6 @@ app.get("/suggest", async (req, res) => {
       const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
       for (const e of currentLoopIns) bump(e, 50, true);
 
-      // Only fetch conversations for top 3 similar tickets to reduce API calls
       const topContactIds = reranked.sort((a, b) => b.score - a.score).slice(0, 3).map(x => x.id);
       for (const id of topContactIds) {
         try {
@@ -589,9 +705,18 @@ app.get("/suggest", async (req, res) => {
         .slice(0, MAX_SUGGESTED_CONTACTS)
         .map(o => ({ email: o.email, confidence: o.sawCurrent ? "High (added on this ticket)" : "High (seen on similar tickets)" }));
 
-      // merge rule-based first then history-based
       const merged = [];
       const seen = new Set();
+
+      if (hierarchy.handledBy) {
+        merged.push({
+          email: hierarchy.handledBy,
+          confidence: hierarchy.matchMode === "tag" ? "High (mapped tag)" : "High (keyword match)",
+          source: hierarchy.matchMode
+        });
+        seen.add(hierarchy.handledBy);
+      }
+
       for (const r of ruleBasedLoopIns) {
         if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
         if (!seen.has(r.email)) { seen.add(r.email); merged.push({ email: r.email, confidence: r.confidence, source: "rule" }); }
@@ -601,21 +726,27 @@ app.get("/suggest", async (req, res) => {
         if (!seen.has(h.email)) { seen.add(h.email); merged.push({ email: h.email, confidence: h.confidence, source: "history" }); }
       }
 
-      // ✅ APPEND: tags + placeholders for new UI sections
       const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
-      const helpfulLinks = [];
-      const processNotes = [];
 
       return {
         ticketId,
         subject: ticket.subject,
-        tags,                 // ✅ used for "⚠ No tags applied"
-        helpfulLinks,         // ✅ new section (currently empty)
-        processNotes,         // ✅ new section (currently empty)
+        tags,
+        matchMode: hierarchy.matchMode,
+        matchedTag: hierarchy.matchedTag,
+        suggestedTags: hierarchy.suggestedTags,
+        handledBy: hierarchy.handledBy,
+        helpfulLinks: hierarchy.helpfulLinks,
+        processNotes: hierarchy.processNotes,
+        hierarchyConfidence: hierarchy.hierarchyConfidence,
         firedRuleIds: currentRuleIds,
         similarTickets,
         suggestedExternalContacts: merged,
-        message: "Cached + rate-limit-safe ✅"
+        message: hierarchy.matchMode === "tag"
+          ? "Tag mode ✅"
+          : hierarchy.matchMode === "keyword"
+            ? "Keyword mode ✅"
+            : "Fallback mode ✅"
       };
     } catch (err) {
       throw err;

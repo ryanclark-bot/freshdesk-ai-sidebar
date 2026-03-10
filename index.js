@@ -47,40 +47,81 @@ try {
   console.log("WARNING: Could not load config/tag_rules.json; using empty tag rules:", e.message);
 }
 
-const MAX_SUGGESTED_CONTACTS = Math.max(1, Number(RULES_CONFIG?.max_suggested_contacts || 2));
-
 /* =========================
-   SIMILARITY TUNING
+   CONSTANTS / CACHES
    ========================= */
 
 const RECENT_DAYS = 180;
 const OLD_DAYS = 540;
-const RERANK_FETCH_LIMIT = 25;
+const RERANK_FETCH_LIMIT = 12;
 const SIMILAR_TICKETS_TO_RETURN = 3;
 
-const RULE_ANCHOR_BONUS = 18;
 const BIGRAM_BONUS = 6;
 const RECENCY_BONUS_MAX = 8;
-
 const SHARED_HOST_BONUS = 25;
 const ANCHOR_MISS_PENALTY = 80;
 const MIN_SIMILAR_SCORE = 35;
 
-/* =========================
-   CACHES
-   ========================= */
-
 const POOL_CACHE_TTL_MS = 10 * 60 * 1000;
+const TICKET_CACHE_TTL_MS = 60 * 1000;
+const CORE_CACHE_TTL_MS = 45 * 1000;
+const SIMILAR_CACHE_TTL_MS = 90 * 1000;
+const SAME_TAG_CACHE_TTL_MS = 2 * 60 * 1000;
+
 let poolCache = { ts: 0, tickets: [] };
 let poolInFlight = null;
 
-const SUGGEST_CACHE_TTL_MS = 30 * 1000;
-const suggestCache = new Map();
-const suggestInFlight = new Map();
+const ticketCache = new Map();
+const coreCache = new Map();
+const similarCache = new Map();
+const sameTagCache = new Map();
+
+const inflightCore = new Map();
+const inflightSimilar = new Map();
+const inflightTicket = new Map();
 
 /* =========================
    HELPERS
    ========================= */
+
+function nowMs() {
+  return Date.now();
+}
+
+function getCached(map, key, ttlMs) {
+  const hit = map.get(key);
+  if (!hit) return null;
+  if ((nowMs() - hit.ts) > ttlMs) {
+    map.delete(key);
+    return null;
+  }
+  return hit.data;
+}
+
+function setCached(map, key, data) {
+  map.set(key, { ts: nowMs(), data });
+}
+
+async function getOrBuildCached({ cacheMap, inflightMap, key, ttlMs, builder }) {
+  const cached = getCached(cacheMap, key, ttlMs);
+  if (cached) return cached;
+
+  if (inflightMap.has(key)) return inflightMap.get(key);
+
+  const p = (async () => {
+    const data = await builder();
+    setCached(cacheMap, key, data);
+    return data;
+  })();
+
+  inflightMap.set(key, p);
+
+  try {
+    return await p;
+  } finally {
+    inflightMap.delete(key);
+  }
+}
 
 function sanitizeDomain(raw) {
   if (!raw) return null;
@@ -192,104 +233,6 @@ function recencyBonus(updatedAtIso) {
   return -frac * (RECENCY_BONUS_MAX / 2);
 }
 
-/* =========================
-   EXCLUSIONS
-   ========================= */
-
-const EXCLUDED_EMAILS = new Set((EXCLUSIONS_CONFIG?.excluded_emails || []).map(normalizeEmail));
-const EXCLUDED_INBOXES = new Set((EXCLUSIONS_CONFIG?.excluded_inboxes || []).map(normalizeEmail));
-const SYSTEM_PREFIXES = (EXCLUSIONS_CONFIG?.system_email_prefixes || [])
-  .map(s => String(s || "").toLowerCase())
-  .filter(Boolean);
-
-function isSystemEmail(email) {
-  const e = normalizeEmail(email);
-  return SYSTEM_PREFIXES.some(prefix => e.startsWith(prefix));
-}
-function isExcluded(email) {
-  const e = normalizeEmail(email);
-  return EXCLUDED_EMAILS.has(e) || EXCLUDED_INBOXES.has(e) || isSystemEmail(e);
-}
-function isValidCandidateEmail(email, requesterEmail) {
-  const e = normalizeEmail(email);
-  const r = normalizeEmail(requesterEmail);
-  if (!e) return false;
-  if (isExcluded(e)) return false;
-  if (r && e === r) return false;
-  return true;
-}
-
-/* =========================
-   LEGACY RULE MATCHING
-   ========================= */
-
-function buildTokenSet(tokens) {
-  return new Set((tokens || []).map(t => String(t).toLowerCase()));
-}
-
-function itemMatches(textLower, tokenSet, item) {
-  const p = String(item || "").toLowerCase().trim();
-  if (!p) return false;
-  if (p.includes(" ")) return textLower.includes(p);
-  return tokenSet.has(p);
-}
-
-function groupMatches(textLower, tokenSet, group) {
-  const anyList = Array.isArray(group?.any) ? group.any : [];
-  const allList = Array.isArray(group?.all) ? group.all : [];
-  if (allList.length > 0) return allList.every(it => itemMatches(textLower, tokenSet, it));
-  if (anyList.length > 0) return anyList.some(it => itemMatches(textLower, tokenSet, it));
-  return false;
-}
-
-function ruleMatches(rule, textLower, tokenSet) {
-  const notAny = Array.isArray(rule?.notAny) ? rule.notAny : [];
-  for (const it of notAny) if (itemMatches(textLower, tokenSet, it)) return false;
-
-  const anyOf = Array.isArray(rule?.anyOf) ? rule.anyOf : [];
-  if (anyOf.length === 0) return false;
-  return anyOf.some(group => groupMatches(textLower, tokenSet, group));
-}
-
-function firedRuleIds(ticketTextLower) {
-  const tokenSet = buildTokenSet(tokenize(ticketTextLower));
-  const fired = [];
-  for (const rule of (RULES_CONFIG?.rules || [])) {
-    if (ruleMatches(rule, ticketTextLower, tokenSet)) fired.push(String(rule.id));
-  }
-  return fired;
-}
-
-function sharedRuleBonus(currentRuleIds, candidateRuleIds) {
-  if (!currentRuleIds.length) return 0;
-  const cand = new Set(candidateRuleIds || []);
-  let shared = 0;
-  for (const id of currentRuleIds) if (cand.has(id)) shared++;
-  return shared * RULE_ANCHOR_BONUS;
-}
-
-function buildRuleSuggestions(ticketTextLower, requesterEmail) {
-  const tokenSet = buildTokenSet(tokenize(ticketTextLower));
-  const suggestions = [];
-
-  for (const rule of (RULES_CONFIG?.rules || [])) {
-    if (!ruleMatches(rule, ticketTextLower, tokenSet)) continue;
-    for (const s of (rule.suggest || [])) {
-      const email = normalizeEmail(s.email);
-      if (!email) continue;
-      if (!isValidCandidateEmail(email, requesterEmail)) continue;
-      suggestions.push({ email, confidence: "High (keyword rule)", reason: `Rule match: ${rule.id}` });
-    }
-  }
-
-  const seen = new Set();
-  return suggestions.filter(s => (seen.has(s.email) ? false : (seen.add(s.email), true)));
-}
-
-/* =========================
-   TAG / KEYWORD HIERARCHY HELPERS
-   ========================= */
-
 function normalizeLoose(s) {
   return String(s || "")
     .toLowerCase()
@@ -325,25 +268,22 @@ function findMappedTagRule(ticketTags) {
 
 function scoreKeywordRule(rule, textNorm) {
   let score = 0;
-  let matchedKeywords = [];
 
   for (const kw of rule.keywordsNorm) {
     if (!kw) continue;
 
     if (textNorm.includes(kw)) {
       score += kw.split(" ").length > 1 ? 12 : 8;
-      matchedKeywords.push(kw);
       continue;
     }
 
     const parts = kw.split(" ").filter(Boolean);
     if (parts.length > 1 && parts.every(p => textNorm.includes(p))) {
       score += 6;
-      matchedKeywords.push(kw);
     }
   }
 
-  return { score, matchedKeywords };
+  return score;
 }
 
 function findKeywordMatches(text) {
@@ -351,13 +291,9 @@ function findKeywordMatches(text) {
   const matches = [];
 
   for (const rule of TAG_RULES) {
-    const { score, matchedKeywords } = scoreKeywordRule(rule, textNorm);
+    const score = scoreKeywordRule(rule, textNorm);
     if (score > 0) {
-      matches.push({
-        rule,
-        score,
-        matchedKeywords
-      });
+      matches.push({ rule, score });
     }
   }
 
@@ -412,6 +348,10 @@ function buildHierarchyPayload(ticket, ticketText) {
   };
 }
 
+function getTicketText(ticket) {
+  return `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
+}
+
 /* =========================
    FRESHDESK SETUP
    ========================= */
@@ -427,7 +367,6 @@ const CONFIG_TOKEN = String(process.env.CONFIG_TOKEN || "").trim();
 console.log("Freshdesk baseURL:", JSON.stringify(baseURL));
 console.log("SALES_HELP_GROUP_ID:", JSON.stringify(SALES_HELP_GROUP_ID));
 console.log("Has FRESHDESK_API_KEY:", Boolean(FRESHDESK_API_KEY));
-console.log("Loaded rules:", (RULES_CONFIG?.rules || []).length);
 console.log("Loaded tag rules:", TAG_RULES.length);
 
 const fd = axios.create({
@@ -480,48 +419,17 @@ async function getSalesHelpPoolTicketsCached() {
   return await poolInFlight;
 }
 
-async function getRequesterEmail(ticket, conversationsMaybe) {
-  const direct =
-    normalizeEmail(ticket?.requester?.email) ||
-    normalizeEmail(ticket?.requester_email) ||
-    normalizeEmail(ticket?.email);
-
-  if (direct) return direct;
-
-  const requesterId = ticket?.requester_id;
-  if (requesterId) {
-    try {
-      const { data } = await fd.get(`/contacts/${requesterId}`);
-      const cEmail = normalizeEmail(data?.email);
-      if (cEmail) return cEmail;
-    } catch {}
-  }
-
-  const convs = Array.isArray(conversationsMaybe) ? conversationsMaybe : [];
-  const incoming = convs
-    .filter(c => c?.incoming === true && c?.from_email)
-    .sort((a, b) => (a?.created_at || "").localeCompare(b?.created_at || ""));
-
-  if (incoming.length) return normalizeEmail(incoming[0].from_email);
-  return "";
-}
-
-function collectLoopInRecipientsFromOutgoing(convs, requesterEmail) {
-  const out = new Set();
-  const list = Array.isArray(convs) ? convs : [];
-
-  for (const conv of list) {
-    if (conv?.incoming === true) continue;
-    const toList = Array.isArray(conv?.to_emails) ? conv.to_emails : [];
-    const ccList = Array.isArray(conv?.cc_emails) ? conv.cc_emails : [];
-    const bccList = Array.isArray(conv?.bcc_emails) ? conv.bcc_emails : [];
-
-    for (const e of [...toList, ...ccList, ...bccList]) {
-      const email = normalizeEmail(e);
-      if (isValidCandidateEmail(email, requesterEmail)) out.add(email);
+async function getTicketCached(ticketId) {
+  return getOrBuildCached({
+    cacheMap: ticketCache,
+    inflightMap: inflightTicket,
+    key: String(ticketId),
+    ttlMs: TICKET_CACHE_TTL_MS,
+    builder: async () => {
+      const { data } = await fd.get(`/tickets/${ticketId}`);
+      return data;
     }
-  }
-  return Array.from(out);
+  });
 }
 
 function to429Error(err) {
@@ -531,31 +439,118 @@ function to429Error(err) {
   return { retryAfter };
 }
 
-async function findRecentSameTagTickets(currentTicketId, tagToMatch, domainForUrl) {
-  const pool = await getSalesHelpPoolTicketsCached();
+/* =========================
+   FAST CORE + SLOW SIMILAR
+   ========================= */
 
+function buildCorePayload(ticket) {
+  const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
+  const ticketText = getTicketText(ticket);
+  const hierarchy = buildHierarchyPayload(ticket, ticketText);
+
+  if (tags.length > 0) {
+    if (hierarchy.matchMode === "tag") {
+      return {
+        ticketId: String(ticket.id),
+        subject: ticket.subject || "",
+        tags,
+        matchMode: "tag",
+        matchedTag: hierarchy.matchedTag,
+        suggestedTags: [],
+        handledBy: hierarchy.handledBy,
+        helpfulLinks: hierarchy.helpfulLinks,
+        processNotes: hierarchy.processNotes,
+        hierarchyConfidence: hierarchy.hierarchyConfidence,
+        suggestedExternalContacts: [],
+        message: "Tag mode ✅"
+      };
+    }
+
+    return {
+      ticketId: String(ticket.id),
+      subject: ticket.subject || "",
+      tags,
+      matchMode: "tag_unmapped",
+      matchedTag: null,
+      suggestedTags: [],
+      handledBy: "",
+      helpfulLinks: [],
+      processNotes: [],
+      hierarchyConfidence: "Tag present (unmapped)",
+      suggestedExternalContacts: [],
+      message: "Tag present ✅ (unmapped)"
+    };
+  }
+
+  if (hierarchy.matchMode === "keyword") {
+    return {
+      ticketId: String(ticket.id),
+      subject: ticket.subject || "",
+      tags: [],
+      matchMode: "keyword",
+      matchedTag: hierarchy.matchedTag,
+      suggestedTags: hierarchy.suggestedTags,
+      handledBy: hierarchy.handledBy,
+      helpfulLinks: hierarchy.helpfulLinks,
+      processNotes: hierarchy.processNotes,
+      hierarchyConfidence: hierarchy.hierarchyConfidence,
+      suggestedExternalContacts: hierarchy.handledBy
+        ? [{ email: hierarchy.handledBy, confidence: "High (keyword match)", source: "keyword" }]
+        : [],
+      message: "Keyword mode ✅"
+    };
+  }
+
+  return {
+    ticketId: String(ticket.id),
+    subject: ticket.subject || "",
+    tags: [],
+    matchMode: "fallback",
+    matchedTag: null,
+    suggestedTags: [],
+    handledBy: "",
+    helpfulLinks: [],
+    processNotes: [],
+    hierarchyConfidence: "No hierarchy match",
+    suggestedExternalContacts: [],
+    message: "Fallback mode ✅"
+  };
+}
+
+async function findRecentSameTagTickets(currentTicketId, tagToMatch, domainForUrl) {
+  const tagKey = normalizeLoose(tagToMatch);
+
+  const cached = getCached(sameTagCache, tagKey, SAME_TAG_CACHE_TTL_MS);
+  if (cached) {
+    return cached
+      .filter(t => String(t.id) !== String(currentTicketId))
+      .slice(0, SIMILAR_TICKETS_TO_RETURN);
+  }
+
+  const pool = await getSalesHelpPoolTicketsCached();
   const candidates = pool
-    .filter(t => String(t.id) !== String(currentTicketId))
     .sort((a, b) => {
       const aMs = parseDateMs(a.updated_at || a.created_at) || 0;
       const bMs = parseDateMs(b.updated_at || b.created_at) || 0;
       return bMs - aMs;
     });
 
-  const out = [];
-  const targetTagNorm = normalizeLoose(tagToMatch);
+  const found = [];
+  let inspected = 0;
 
   for (const t of candidates) {
-    if (out.length >= SIMILAR_TICKETS_TO_RETURN) break;
+    if (found.length >= 8) break;
+    if (inspected >= 120) break;
+    inspected += 1;
 
     try {
-      const { data } = await fd.get(`/tickets/${t.id}`);
+      const data = await getTicketCached(t.id);
       const ticketTags = Array.isArray(data?.tags) ? data.tags : [];
       const tagNorms = new Set(ticketTags.map(normalizeLoose));
 
-      if (!tagNorms.has(targetTagNorm)) continue;
+      if (!tagNorms.has(tagKey)) continue;
 
-      out.push({
+      found.push({
         id: data.id,
         subject: data.subject || "",
         score: null,
@@ -567,7 +562,159 @@ async function findRecentSameTagTickets(currentTicketId, tagToMatch, domainForUr
     }
   }
 
-  return out;
+  setCached(sameTagCache, tagKey, found);
+
+  return found
+    .filter(t => String(t.id) !== String(currentTicketId))
+    .slice(0, SIMILAR_TICKETS_TO_RETURN);
+}
+
+async function findSemanticSimilarTickets(ticket) {
+  const cacheKey = `semantic:${ticket.id}`;
+  const cached = getCached(similarCache, cacheKey, SIMILAR_CACHE_TTL_MS);
+  if (cached) return cached;
+
+  const ticketText = getTicketText(ticket);
+  const ticketTextLower = ticketText.toLowerCase();
+
+  const currentRuleIds = [];
+  const currentTokenSet = new Set(tokenize(ticketTextLower));
+  const currentBigrams = makeBigrams(tokenize(ticketTextLower));
+  const currentHosts = extractUrlHosts(ticketText);
+  const hasStrongAnchor = currentRuleIds.length > 0 || currentHosts.size > 0;
+
+  const pooled = await getSalesHelpPoolTicketsCached();
+  const candidates = pooled.filter(t => String(t.id) !== String(ticket.id));
+
+  const idfMap = buildIdfMap(candidates.map(t => new Set(tokenize(t.subject || ""))));
+
+  const pass1 = candidates.map(t => {
+    const subjLower = String(t.subject || "").toLowerCase();
+    const candTokenSet = new Set(tokenize(subjLower));
+    const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
+    const bigram = bigramBonus(currentBigrams, subjLower);
+    const rec = recencyBonus(t.updated_at || t.created_at);
+
+    const candHosts = extractUrlHosts(String(t.subject || ""));
+    const hostBonus = sharedHostBonus(currentHosts, candHosts);
+
+    const sharesAnchor = currentHosts.size > 0 && hostBonus > 0;
+    const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
+    const score1 = base + bigram + rec + hostBonus + anchorPenalty;
+
+    return { id: t.id, subject: t.subject || "", score1 };
+  });
+
+  const top = pass1.sort((a, b) => b.score1 - a.score1).slice(0, RERANK_FETCH_LIMIT);
+
+  const reranked = await Promise.all(top.map(async (t) => {
+    try {
+      const data = await getTicketCached(t.id);
+      const fullText = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
+      const fullLower = fullText.toLowerCase();
+
+      const candTokenSet = new Set(tokenize(fullLower));
+      const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
+      const bigram = bigramBonus(currentBigrams, fullLower);
+      const rec = recencyBonus(data.updated_at || data.created_at);
+
+      const candHosts = extractUrlHosts(fullText);
+      const hostBonus = sharedHostBonus(currentHosts, candHosts);
+
+      const sharesAnchor = currentHosts.size > 0 && hostBonus > 0;
+      const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
+      const score = base + bigram + rec + hostBonus + anchorPenalty;
+
+      return {
+        id: data.id,
+        subject: data.subject || t.subject,
+        score,
+        confidence: confidenceLabel(score),
+        url: `${freshdeskDomain}/a/tickets/${data.id}`
+      };
+    } catch {
+      return {
+        id: t.id,
+        subject: t.subject,
+        score: t.score1,
+        confidence: confidenceLabel(t.score1),
+        url: `${freshdeskDomain}/a/tickets/${t.id}`
+      };
+    }
+  }));
+
+  const similarTickets = reranked
+    .sort((a, b) => b.score - a.score)
+    .filter(t => t.score >= MIN_SIMILAR_SCORE)
+    .slice(0, SIMILAR_TICKETS_TO_RETURN)
+    .map(t => ({
+      id: t.id,
+      subject: t.subject,
+      score: Math.round(t.score * 10) / 10,
+      confidence: t.confidence,
+      url: t.url
+    }));
+
+  setCached(similarCache, cacheKey, similarTickets);
+  return similarTickets;
+}
+
+async function buildCoreResponse(ticketId) {
+  return getOrBuildCached({
+    cacheMap: coreCache,
+    inflightMap: inflightCore,
+    key: String(ticketId),
+    ttlMs: CORE_CACHE_TTL_MS,
+    builder: async () => {
+      const ticket = await getTicketCached(ticketId);
+
+      if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
+        return { hide: true, reason: "Not Sales Help", group_id: ticket.group_id };
+      }
+
+      return buildCorePayload(ticket);
+    }
+  });
+}
+
+async function buildSimilarResponse(ticketId) {
+  return getOrBuildCached({
+    cacheMap: similarCache,
+    inflightMap: inflightSimilar,
+    key: `route:${ticketId}`,
+    ttlMs: SIMILAR_CACHE_TTL_MS,
+    builder: async () => {
+      const ticket = await getTicketCached(ticketId);
+
+      if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
+        return { hide: true, reason: "Not Sales Help", group_id: ticket.group_id };
+      }
+
+      const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
+      const hierarchy = buildHierarchyPayload(ticket, getTicketText(ticket));
+
+      if (tags.length > 0) {
+        const displayTag = hierarchy.matchMode === "tag"
+          ? hierarchy.matchedTag
+          : String(tags[0] || "").trim();
+
+        const sameTagTickets = displayTag
+          ? await findRecentSameTagTickets(ticketId, displayTag, freshdeskDomain)
+          : [];
+
+        return {
+          ticketId: String(ticket.id),
+          similarTickets: sameTagTickets
+        };
+      }
+
+      const semantic = await findSemanticSimilarTickets(ticket);
+      return {
+        ticketId: String(ticket.id),
+        similarTickets: semantic
+      };
+    }
+  });
 }
 
 /* =========================
@@ -584,11 +731,17 @@ app.get("/config", (req, res) => {
   return res.json({
     rules_loaded: (RULES_CONFIG?.rules || []).map(r => r.id),
     tag_rules_loaded: TAG_RULES.map(r => r.tag),
-    cache: { POOL_CACHE_TTL_MS, SUGGEST_CACHE_TTL_MS }
+    cache: {
+      POOL_CACHE_TTL_MS,
+      TICKET_CACHE_TTL_MS,
+      CORE_CACHE_TTL_MS,
+      SIMILAR_CACHE_TTL_MS,
+      SAME_TAG_CACHE_TTL_MS
+    }
   });
 });
 
-app.get("/suggest", async (req, res) => {
+app.get("/suggest_core", async (req, res) => {
   const ticketId = String(req.query.ticketId || "").trim();
   if (!ticketId) return res.status(400).send("Missing ticketId");
 
@@ -596,280 +749,8 @@ app.get("/suggest", async (req, res) => {
   if (!FRESHDESK_API_KEY) return res.status(500).send("Server misconfigured: missing FRESHDESK_API_KEY");
   if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
 
-  const cached = suggestCache.get(ticketId);
-  if (cached && (Date.now() - cached.ts) < SUGGEST_CACHE_TTL_MS) return res.json(cached.data);
-
-  if (suggestInFlight.has(ticketId)) {
-    try {
-      const data = await suggestInFlight.get(ticketId);
-      return res.json(data);
-    } catch (e) {
-      const rl = to429Error(e);
-      if (rl) return res.status(429).json({ error: "Freshdesk rate limit (429). Please retry.", retryAfter: rl.retryAfter || null });
-      return res.status(500).json({ error: String(e?.message || e) });
-    }
-  }
-
-  const p = (async () => {
-    try {
-      const [{ data: ticket }, { data: currentConvsRaw }] = await Promise.all([
-        fd.get(`/tickets/${ticketId}`),
-        fd.get(`/tickets/${ticketId}/conversations`)
-      ]);
-      const currentConvs = Array.isArray(currentConvsRaw) ? currentConvsRaw : [];
-
-      if (String(ticket.group_id) !== SALES_HELP_GROUP_ID) {
-        return { hide: true, reason: "Not Sales Help", group_id: ticket.group_id };
-      }
-
-      const requesterEmail = await getRequesterEmail(ticket, currentConvs);
-      const ticketText = `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
-      const ticketTextLower = ticketText.toLowerCase();
-
-      const hierarchy = buildHierarchyPayload(ticket, ticketText);
-      const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
-
-      /* -------------------------
-         ANY TAG PRESENT => TAG PATH ONLY
-         ------------------------- */
-      if (tags.length > 0) {
-        const displayTag = hierarchy.matchMode === "tag"
-          ? hierarchy.matchedTag
-          : String(tags[0] || "").trim();
-
-        const sameTagTickets = displayTag
-          ? await findRecentSameTagTickets(ticketId, displayTag, freshdeskDomain)
-          : [];
-
-        if (hierarchy.matchMode === "tag") {
-          return {
-            ticketId,
-            subject: ticket.subject,
-            tags,
-            matchMode: hierarchy.matchMode,
-            matchedTag: hierarchy.matchedTag,
-            suggestedTags: [],
-            handledBy: hierarchy.handledBy,
-            helpfulLinks: hierarchy.helpfulLinks,
-            processNotes: hierarchy.processNotes,
-            hierarchyConfidence: hierarchy.hierarchyConfidence,
-            firedRuleIds: [],
-            similarTickets: sameTagTickets,
-            suggestedExternalContacts: [],
-            message: "Tag mode ✅ (strict + same-tag recent tickets)"
-          };
-        }
-
-        return {
-          ticketId,
-          subject: ticket.subject,
-          tags,
-          matchMode: "tag_unmapped",
-          matchedTag: null,
-          suggestedTags: [],
-          handledBy: "",
-          helpfulLinks: [],
-          processNotes: [],
-          hierarchyConfidence: "Tag present (unmapped)",
-          firedRuleIds: [],
-          similarTickets: sameTagTickets,
-          suggestedExternalContacts: [],
-          message: "Tag present ✅ (unmapped, keyword mode skipped)"
-        };
-      }
-
-      /* -------------------------
-         NO-TAG MODES ONLY
-         ------------------------- */
-
-      const currentRuleIds = firedRuleIds(ticketTextLower);
-      const currentTokenSet = new Set(tokenize(ticketTextLower));
-      const currentBigrams = makeBigrams(tokenize(ticketTextLower));
-      const currentHosts = extractUrlHosts(ticketText);
-      const hasStrongAnchor = currentRuleIds.length > 0 || currentHosts.size > 0;
-
-      const ruleBasedLoopIns = buildRuleSuggestions(ticketTextLower, requesterEmail).slice(0, MAX_SUGGESTED_CONTACTS);
-
-      const pooled = await getSalesHelpPoolTicketsCached();
-      const candidates = pooled.filter(t => String(t.id) !== ticketId);
-
-      const idfMap = buildIdfMap(candidates.map(t => new Set(tokenize(t.subject || ""))));
-
-      const pass1 = candidates.map(t => {
-        const subjLower = String(t.subject || "").toLowerCase();
-        const candTokenSet = new Set(tokenize(subjLower));
-        const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
-        const bigram = bigramBonus(currentBigrams, subjLower);
-        const rec = recencyBonus(t.updated_at || t.created_at);
-
-        const candRuleIds = firedRuleIds(subjLower);
-        const ruleBonus = sharedRuleBonus(currentRuleIds, candRuleIds);
-
-        const candHosts = extractUrlHosts(String(t.subject || ""));
-        const hostBonus = sharedHostBonus(currentHosts, candHosts);
-
-        const sharesAnchor =
-          (currentRuleIds.length > 0 && ruleBonus > 0) ||
-          (currentHosts.size > 0 && hostBonus > 0);
-
-        const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
-        const score1 = base + bigram + rec + ruleBonus + hostBonus + anchorPenalty;
-
-        return { id: t.id, subject: t.subject || "", score1 };
-      });
-
-      const top = pass1.sort((a, b) => b.score1 - a.score1).slice(0, RERANK_FETCH_LIMIT);
-
-      const reranked = await Promise.all(top.map(async (t) => {
-        try {
-          const { data } = await fd.get(`/tickets/${t.id}`);
-          const fullText = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
-          const fullLower = fullText.toLowerCase();
-
-          const candTokenSet = new Set(tokenize(fullLower));
-          const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
-          const bigram = bigramBonus(currentBigrams, fullLower);
-          const rec = recencyBonus(data.updated_at || data.created_at);
-
-          const candRuleIds = firedRuleIds(fullLower);
-          const ruleBonus = sharedRuleBonus(currentRuleIds, candRuleIds);
-
-          const candHosts = extractUrlHosts(fullText);
-          const hostBonus = sharedHostBonus(currentHosts, candHosts);
-
-          const sharesAnchor =
-            (currentRuleIds.length > 0 && ruleBonus > 0) ||
-            (currentHosts.size > 0 && hostBonus > 0);
-
-          const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
-          const score = base + bigram + rec + ruleBonus + hostBonus + anchorPenalty;
-
-          return {
-            id: t.id,
-            subject: data.subject || t.subject,
-            score,
-            confidence: confidenceLabel(score),
-            url: `${freshdeskDomain}/a/tickets/${t.id}`
-          };
-        } catch {
-          return {
-            id: t.id,
-            subject: t.subject,
-            score: t.score1,
-            confidence: confidenceLabel(t.score1),
-            url: `${freshdeskDomain}/a/tickets/${t.id}`
-          };
-        }
-      }));
-
-      const similarTickets = reranked
-        .sort((a, b) => b.score - a.score)
-        .filter(t => t.score >= MIN_SIMILAR_SCORE)
-        .slice(0, SIMILAR_TICKETS_TO_RETURN)
-        .map(t => ({
-          id: t.id,
-          subject: t.subject,
-          score: Math.round(t.score * 10) / 10,
-          confidence: t.confidence,
-          url: t.url
-        }));
-
-      const historySet = new Map();
-      function bump(email, points, sawCurrent) {
-        const e = normalizeEmail(email);
-        if (!isValidCandidateEmail(e, requesterEmail)) return;
-        if (!historySet.has(e)) historySet.set(e, { email: e, score: 0, sawCurrent: false });
-        const obj = historySet.get(e);
-        obj.score += points;
-        if (sawCurrent) obj.sawCurrent = true;
-      }
-
-      const currentLoopIns = collectLoopInRecipientsFromOutgoing(currentConvs, requesterEmail);
-      for (const e of currentLoopIns) bump(e, 50, true);
-
-      const topContactIds = reranked.sort((a, b) => b.score - a.score).slice(0, 3).map(x => x.id);
-      for (const id of topContactIds) {
-        try {
-          const [{ data: t }, { data: convsRaw }] = await Promise.all([
-            fd.get(`/tickets/${id}`),
-            fd.get(`/tickets/${id}/conversations`)
-          ]);
-          const convs = Array.isArray(convsRaw) ? convsRaw : [];
-          const reqEmail = await getRequesterEmail(t, convs);
-          const loopIns = collectLoopInRecipientsFromOutgoing(convs, reqEmail);
-          for (const e of loopIns) bump(e, 10, false);
-        } catch {}
-      }
-
-      const historyBased = Array.from(historySet.values())
-        .sort((a, b) => {
-          const aCur = a.sawCurrent ? 1 : 0;
-          const bCur = b.sawCurrent ? 1 : 0;
-          if (bCur !== aCur) return bCur - aCur;
-          return b.score - a.score;
-        })
-        .slice(0, MAX_SUGGESTED_CONTACTS)
-        .map(o => ({
-          email: o.email,
-          confidence: o.sawCurrent ? "High (added on this ticket)" : "High (seen on similar tickets)"
-        }));
-
-      const merged = [];
-      const seen = new Set();
-
-      if (hierarchy.matchMode === "keyword" && hierarchy.handledBy) {
-        merged.push({
-          email: hierarchy.handledBy,
-          confidence: "High (keyword match)",
-          source: "keyword"
-        });
-        seen.add(hierarchy.handledBy);
-      }
-
-      for (const r of ruleBasedLoopIns) {
-        if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
-        if (!seen.has(r.email)) {
-          seen.add(r.email);
-          merged.push({ email: r.email, confidence: r.confidence, source: "rule" });
-        }
-      }
-
-      for (const h of historyBased) {
-        if (merged.length >= MAX_SUGGESTED_CONTACTS) break;
-        if (!seen.has(h.email)) {
-          seen.add(h.email);
-          merged.push({ email: h.email, confidence: h.confidence, source: "history" });
-        }
-      }
-
-      return {
-        ticketId,
-        subject: ticket.subject,
-        tags,
-        matchMode: hierarchy.matchMode,
-        matchedTag: hierarchy.matchedTag,
-        suggestedTags: hierarchy.suggestedTags,
-        handledBy: hierarchy.handledBy,
-        helpfulLinks: hierarchy.helpfulLinks,
-        processNotes: hierarchy.processNotes,
-        hierarchyConfidence: hierarchy.hierarchyConfidence,
-        firedRuleIds: currentRuleIds,
-        similarTickets,
-        suggestedExternalContacts: merged,
-        message: hierarchy.matchMode === "keyword"
-          ? "Keyword mode ✅"
-          : "Fallback mode ✅"
-      };
-    } catch (err) {
-      throw err;
-    }
-  })();
-
-  suggestInFlight.set(ticketId, p);
-
   try {
-    const data = await p;
-    suggestCache.set(ticketId, { ts: Date.now(), data });
+    const data = await buildCoreResponse(ticketId);
     return res.json(data);
   } catch (err) {
     const rl = to429Error(err);
@@ -879,14 +760,70 @@ app.get("/suggest", async (req, res) => {
         retryAfter: rl.retryAfter || null
       });
     }
-    const status = err?.response?.status || 500;
-    return res.status(status).json({
+    return res.status(err?.response?.status || 500).json({
       error: err.message || String(err),
       freshdeskStatus: err.response?.status || null,
       freshdeskData: err.response?.data || null
     });
-  } finally {
-    suggestInFlight.delete(ticketId);
+  }
+});
+
+app.get("/suggest_similar", async (req, res) => {
+  const ticketId = String(req.query.ticketId || "").trim();
+  if (!ticketId) return res.status(400).send("Missing ticketId");
+
+  if (!baseURL) return res.status(500).send("Server misconfigured: invalid FRESHDESK_DOMAIN");
+  if (!FRESHDESK_API_KEY) return res.status(500).send("Server misconfigured: missing FRESHDESK_API_KEY");
+  if (!SALES_HELP_GROUP_ID) return res.status(500).send("Server misconfigured: missing SALES_HELP_GROUP_ID");
+
+  try {
+    const data = await buildSimilarResponse(ticketId);
+    return res.json(data);
+  } catch (err) {
+    const rl = to429Error(err);
+    if (rl) {
+      return res.status(429).json({
+        error: "Freshdesk rate limit (429). Wait a bit and retry.",
+        retryAfter: rl.retryAfter || null
+      });
+    }
+    return res.status(err?.response?.status || 500).json({
+      error: err.message || String(err),
+      freshdeskStatus: err.response?.status || null,
+      freshdeskData: err.response?.data || null
+    });
+  }
+});
+
+app.get("/suggest", async (req, res) => {
+  const ticketId = String(req.query.ticketId || "").trim();
+  if (!ticketId) return res.status(400).send("Missing ticketId");
+
+  try {
+    const [core, similar] = await Promise.all([
+      buildCoreResponse(ticketId),
+      buildSimilarResponse(ticketId)
+    ]);
+
+    if (core?.hide) return res.json(core);
+
+    return res.json({
+      ...core,
+      similarTickets: Array.isArray(similar?.similarTickets) ? similar.similarTickets : []
+    });
+  } catch (err) {
+    const rl = to429Error(err);
+    if (rl) {
+      return res.status(429).json({
+        error: "Freshdesk rate limit (429). Wait a bit and retry.",
+        retryAfter: rl.retryAfter || null
+      });
+    }
+    return res.status(err?.response?.status || 500).json({
+      error: err.message || String(err),
+      freshdeskStatus: err.response?.status || null,
+      freshdeskData: err.response?.data || null
+    });
   }
 });
 

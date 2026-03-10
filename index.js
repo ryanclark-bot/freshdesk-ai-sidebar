@@ -531,11 +531,7 @@ function to429Error(err) {
   return { retryAfter };
 }
 
-function hasMappedTag(ticketTags) {
-  return !!findMappedTagRule(ticketTags);
-}
-
-async function findRecentSameTagTickets(currentTicketId, mappedTag, freshdeskDomain) {
+async function findRecentSameTagTickets(currentTicketId, tagToMatch, domainForUrl) {
   const pool = await getSalesHelpPoolTicketsCached();
 
   const candidates = pool
@@ -547,7 +543,7 @@ async function findRecentSameTagTickets(currentTicketId, mappedTag, freshdeskDom
     });
 
   const out = [];
-  const mappedTagNorm = normalizeLoose(mappedTag);
+  const targetTagNorm = normalizeLoose(tagToMatch);
 
   for (const t of candidates) {
     if (out.length >= SIMILAR_TICKETS_TO_RETURN) break;
@@ -557,14 +553,14 @@ async function findRecentSameTagTickets(currentTicketId, mappedTag, freshdeskDom
       const ticketTags = Array.isArray(data?.tags) ? data.tags : [];
       const tagNorms = new Set(ticketTags.map(normalizeLoose));
 
-      if (!tagNorms.has(mappedTagNorm)) continue;
+      if (!tagNorms.has(targetTagNorm)) continue;
 
       out.push({
         id: data.id,
         subject: data.subject || "",
         score: null,
         confidence: "Same tag",
-        url: `${freshdeskDomain}/a/tickets/${data.id}`
+        url: `${domainForUrl}/a/tickets/${data.id}`
       });
     } catch {
       // skip quietly
@@ -634,31 +630,56 @@ app.get("/suggest", async (req, res) => {
       const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
 
       /* -------------------------
-         STRICT TAG MODE
+         ANY TAG PRESENT => TAG PATH ONLY
          ------------------------- */
-      if (hierarchy.matchMode === "tag") {
-        const sameTagTickets = await findRecentSameTagTickets(ticketId, hierarchy.matchedTag, freshdeskDomain);
+      if (tags.length > 0) {
+        const displayTag = hierarchy.matchMode === "tag"
+          ? hierarchy.matchedTag
+          : String(tags[0] || "").trim();
+
+        const sameTagTickets = displayTag
+          ? await findRecentSameTagTickets(ticketId, displayTag, freshdeskDomain)
+          : [];
+
+        if (hierarchy.matchMode === "tag") {
+          return {
+            ticketId,
+            subject: ticket.subject,
+            tags,
+            matchMode: hierarchy.matchMode,
+            matchedTag: hierarchy.matchedTag,
+            suggestedTags: [],
+            handledBy: hierarchy.handledBy,
+            helpfulLinks: hierarchy.helpfulLinks,
+            processNotes: hierarchy.processNotes,
+            hierarchyConfidence: hierarchy.hierarchyConfidence,
+            firedRuleIds: [],
+            similarTickets: sameTagTickets,
+            suggestedExternalContacts: [],
+            message: "Tag mode ✅ (strict + same-tag recent tickets)"
+          };
+        }
 
         return {
           ticketId,
           subject: ticket.subject,
           tags,
-          matchMode: hierarchy.matchMode,
-          matchedTag: hierarchy.matchedTag,
+          matchMode: "tag_unmapped",
+          matchedTag: null,
           suggestedTags: [],
-          handledBy: hierarchy.handledBy,
-          helpfulLinks: hierarchy.helpfulLinks,
-          processNotes: hierarchy.processNotes,
-          hierarchyConfidence: hierarchy.hierarchyConfidence,
+          handledBy: "",
+          helpfulLinks: [],
+          processNotes: [],
+          hierarchyConfidence: "Tag present (unmapped)",
           firedRuleIds: [],
           similarTickets: sameTagTickets,
           suggestedExternalContacts: [],
-          message: "Tag mode ✅ (strict + same-tag recent tickets)"
+          message: "Tag present ✅ (unmapped, keyword mode skipped)"
         };
       }
 
       /* -------------------------
-         NO-TAG MODES
+         NO-TAG MODES ONLY
          ------------------------- */
 
       const currentRuleIds = firedRuleIds(ticketTextLower);

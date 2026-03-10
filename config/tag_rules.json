@@ -56,11 +56,18 @@
     "notes": "If we can't troubleshoot ourselves, loop in Kade and/or Jordan"
   },
   {
-    "tag": "CSX User Error",
-    "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact"],
+    "tag": "CSX Error",
+    "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "Growth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact", "CSX User Error"],
     "handledBy": "Product Support",
     "helpfulLinks": ["https://docs.google.com/document/d/1Ql8TEKOG1G4agZMShsM5buId0sPMdzpJcSb-ZD7IYOo/edit?tab=t.0"],
-    "notes": "Loop in Product Support if needed. Create child ticket. DO NOT add PS onto the email in freshdesk."
+    "notes": "Loop in Product Support if needed. Create child ticket. DO NOT add PS onto the email in freshdesk. Troubleshoot and loop in Product Support if needed. Always add them as a child ticket!"
+  },  
+  {
+    "tag": "CSX User Error",
+    "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "Growth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact", "CSX User Error"],
+    "handledBy": "Product Support",
+    "helpfulLinks": ["https://docs.google.com/document/d/1Ql8TEKOG1G4agZMShsM5buId0sPMdzpJcSb-ZD7IYOo/edit?tab=t.0"],
+    "notes": "Loop in Product Support if needed. Create child ticket. DO NOT add PS onto the email in freshdesk. Troubleshoot and loop in Product Support if needed. Always add them as a child ticket!"
   },
   {
     "tag": "delete contact",
@@ -89,13 +96,6 @@
     "handledBy": "scorpion@scorpion.co",
     "helpfulLinks": [],
     "notes": ""
-  },
-  {
-    "tag": "Growth Advisor Error",
-    "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact"],
-    "handledBy": "",
-    "helpfulLinks": [],
-    "notes": "Troubleshoot and loop in Product Support if needed. Always add them as a child ticket!"
   },
   {
     "tag": "Growth Advisor/Deal Builder",

@@ -440,7 +440,7 @@ function to429Error(err) {
 }
 
 /* =========================
-   FAST CORE + SLOW SIMILAR
+   FAST CORE + TAG-ONLY SIMILAR
    ========================= */
 
 function buildCorePayload(ticket) {
@@ -569,96 +569,6 @@ async function findRecentSameTagTickets(currentTicketId, tagToMatch, domainForUr
     .slice(0, SIMILAR_TICKETS_TO_RETURN);
 }
 
-async function findSemanticSimilarTickets(ticket) {
-  const cacheKey = `semantic:${ticket.id}`;
-  const cached = getCached(similarCache, cacheKey, SIMILAR_CACHE_TTL_MS);
-  if (cached) return cached;
-
-  const ticketText = getTicketText(ticket);
-  const ticketTextLower = ticketText.toLowerCase();
-
-  const currentRuleIds = [];
-  const currentTokenSet = new Set(tokenize(ticketTextLower));
-  const currentBigrams = makeBigrams(tokenize(ticketTextLower));
-  const currentHosts = extractUrlHosts(ticketText);
-  const hasStrongAnchor = currentRuleIds.length > 0 || currentHosts.size > 0;
-
-  const pooled = await getSalesHelpPoolTicketsCached();
-  const candidates = pooled.filter(t => String(t.id) !== String(ticket.id));
-
-  const idfMap = buildIdfMap(candidates.map(t => new Set(tokenize(t.subject || ""))));
-
-  const pass1 = candidates.map(t => {
-    const subjLower = String(t.subject || "").toLowerCase();
-    const candTokenSet = new Set(tokenize(subjLower));
-    const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
-    const bigram = bigramBonus(currentBigrams, subjLower);
-    const rec = recencyBonus(t.updated_at || t.created_at);
-
-    const candHosts = extractUrlHosts(String(t.subject || ""));
-    const hostBonus = sharedHostBonus(currentHosts, candHosts);
-
-    const sharesAnchor = currentHosts.size > 0 && hostBonus > 0;
-    const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
-    const score1 = base + bigram + rec + hostBonus + anchorPenalty;
-
-    return { id: t.id, subject: t.subject || "", score1 };
-  });
-
-  const top = pass1.sort((a, b) => b.score1 - a.score1).slice(0, RERANK_FETCH_LIMIT);
-
-  const reranked = await Promise.all(top.map(async (t) => {
-    try {
-      const data = await getTicketCached(t.id);
-      const fullText = `${data.subject || ""}\n${data.description_text || stripHtml(data.description) || ""}`;
-      const fullLower = fullText.toLowerCase();
-
-      const candTokenSet = new Set(tokenize(fullLower));
-      const base = overlapScoreIdf(currentTokenSet, candTokenSet, idfMap);
-      const bigram = bigramBonus(currentBigrams, fullLower);
-      const rec = recencyBonus(data.updated_at || data.created_at);
-
-      const candHosts = extractUrlHosts(fullText);
-      const hostBonus = sharedHostBonus(currentHosts, candHosts);
-
-      const sharesAnchor = currentHosts.size > 0 && hostBonus > 0;
-      const anchorPenalty = (hasStrongAnchor && !sharesAnchor) ? -ANCHOR_MISS_PENALTY : 0;
-      const score = base + bigram + rec + hostBonus + anchorPenalty;
-
-      return {
-        id: data.id,
-        subject: data.subject || t.subject,
-        score,
-        confidence: confidenceLabel(score),
-        url: `${freshdeskDomain}/a/tickets/${data.id}`
-      };
-    } catch {
-      return {
-        id: t.id,
-        subject: t.subject,
-        score: t.score1,
-        confidence: confidenceLabel(t.score1),
-        url: `${freshdeskDomain}/a/tickets/${t.id}`
-      };
-    }
-  }));
-
-  const similarTickets = reranked
-    .sort((a, b) => b.score - a.score)
-    .filter(t => t.score >= MIN_SIMILAR_SCORE)
-    .slice(0, SIMILAR_TICKETS_TO_RETURN)
-    .map(t => ({
-      id: t.id,
-      subject: t.subject,
-      score: Math.round(t.score * 10) / 10,
-      confidence: t.confidence,
-      url: t.url
-    }));
-
-  setCached(similarCache, cacheKey, similarTickets);
-  return similarTickets;
-}
-
 async function buildCoreResponse(ticketId) {
   return getOrBuildCached({
     cacheMap: coreCache,
@@ -693,25 +603,21 @@ async function buildSimilarResponse(ticketId) {
       const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
       const hierarchy = buildHierarchyPayload(ticket, getTicketText(ticket));
 
-      if (tags.length > 0) {
-        const displayTag = hierarchy.matchMode === "tag"
-          ? hierarchy.matchedTag
-          : String(tags[0] || "").trim();
-
-        const sameTagTickets = displayTag
-          ? await findRecentSameTagTickets(ticketId, displayTag, freshdeskDomain)
-          : [];
-
+      // TAGGING IS KING:
+      // - if there is a mapped tag, pull same-tag recent tickets
+      // - if there is no tag, do not run semantic similarity at all
+      // - if there is an unmapped tag, show no related tickets for now
+      if (tags.length > 0 && hierarchy.matchMode === "tag") {
+        const sameTagTickets = await findRecentSameTagTickets(ticketId, hierarchy.matchedTag, freshdeskDomain);
         return {
           ticketId: String(ticket.id),
           similarTickets: sameTagTickets
         };
       }
 
-      const semantic = await findSemanticSimilarTickets(ticket);
       return {
         ticketId: String(ticket.id),
-        similarTickets: semantic
+        similarTickets: []
       };
     }
   });

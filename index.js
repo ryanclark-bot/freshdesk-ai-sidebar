@@ -8,37 +8,13 @@ const path = require("path");
 const app = express();
 app.use(cors());
 
-/* =========================
-   LOAD CONFIG FILES
-   ========================= */
-
 function readJson(filePath) {
   const abs = path.join(__dirname, filePath);
   const raw = fs.readFileSync(abs, "utf8");
   return JSON.parse(raw);
 }
 
-let RULES_CONFIG = { max_suggested_contacts: 2, rules: [] };
-let EXCLUSIONS_CONFIG = {
-  excluded_emails: [],
-  excluded_inboxes: ["saleshelp@scorpion.co"],
-  system_email_prefixes: ["freshdesk", "no-reply", "noreply", "notification", "notifications"],
-};
 let TAG_RULES_CONFIG = [];
-
-try {
-  RULES_CONFIG = readJson("config/rules.json");
-  console.log("Loaded config/rules.json");
-} catch (e) {
-  console.log("WARNING: Could not load config/rules.json; using defaults:", e.message);
-}
-
-try {
-  EXCLUSIONS_CONFIG = readJson("config/excluded_emails.json");
-  console.log("Loaded config/excluded_emails.json");
-} catch (e) {
-  console.log("WARNING: Could not load config/excluded_emails.json; using defaults:", e.message);
-}
 
 try {
   TAG_RULES_CONFIG = readJson("config/tag_rules.json");
@@ -47,26 +23,12 @@ try {
   console.log("WARNING: Could not load config/tag_rules.json; using empty tag rules:", e.message);
 }
 
-/* =========================
-   CONSTANTS / CACHES
-   ========================= */
-
-const RECENT_DAYS = 180;
-const OLD_DAYS = 540;
-const RERANK_FETCH_LIMIT = 12;
-const SIMILAR_TICKETS_TO_RETURN = 3;
-
-const BIGRAM_BONUS = 6;
-const RECENCY_BONUS_MAX = 8;
-const SHARED_HOST_BONUS = 25;
-const ANCHOR_MISS_PENALTY = 80;
-const MIN_SIMILAR_SCORE = 35;
-
 const POOL_CACHE_TTL_MS = 10 * 60 * 1000;
 const TICKET_CACHE_TTL_MS = 60 * 1000;
 const CORE_CACHE_TTL_MS = 45 * 1000;
 const SIMILAR_CACHE_TTL_MS = 90 * 1000;
 const SAME_TAG_CACHE_TTL_MS = 2 * 60 * 1000;
+const SIMILAR_TICKETS_TO_RETURN = 3;
 
 let poolCache = { ts: 0, tickets: [] };
 let poolInFlight = null;
@@ -79,10 +41,6 @@ const sameTagCache = new Map();
 const inflightCore = new Map();
 const inflightSimilar = new Map();
 const inflightTicket = new Map();
-
-/* =========================
-   HELPERS
-   ========================= */
 
 function nowMs() {
   return Date.now();
@@ -127,110 +85,27 @@ function sanitizeDomain(raw) {
   if (!raw) return null;
   return String(raw).trim().replace(/\/+$/, "");
 }
+
 function buildBaseUrl(domain) {
   if (!domain) return null;
   return `${domain}/api/v2`;
 }
+
 function stripHtml(s) {
   return String(s || "").replace(/<[^>]*>/g, " ");
 }
+
 function uniqById(tickets) {
   const m = new Map();
-  for (const t of tickets) if (t && t.id != null) m.set(String(t.id), t);
+  for (const t of tickets) {
+    if (t && t.id != null) m.set(String(t.id), t);
+  }
   return Array.from(m.values());
 }
-function normalizeEmail(email) {
-  return String(email || "").trim().toLowerCase();
-}
-function confidenceLabel(score) {
-  if (score >= 60) return "Likely";
-  if (score >= 35) return "Possible";
-  return "Low";
-}
+
 function parseDateMs(s) {
   const ms = Date.parse(String(s || ""));
   return Number.isFinite(ms) ? ms : null;
-}
-function daysAgoFromIso(iso) {
-  const ms = parseDateMs(iso);
-  if (!ms) return null;
-  const ageMs = Date.now() - ms;
-  return ageMs / (1000 * 60 * 60 * 24);
-}
-function tokenize(text) {
-  const stop = new Set([
-    "the","a","an","and","or","to","of","in","on","for","with","at","from","by","is","are","was","were",
-    "it","this","that","we","you","i","they","them","us","as","be","been","being","can","could","should",
-    "would","will","just","please","thanks","thank",
-    "help","urgent","update","issue","question","ticket","request","need","needed","asap",
-    "team","hi","hello","regards",
-    "scorpion","saleshelp","support",
-    "client","clients","customer","customers",
-    "account","accounts",
-    "looking","trying","figure","proper","way"
-  ]);
-
-  return String(text || "")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/g)
-    .filter(w => w && w.length >= 2 && !stop.has(w));
-}
-function makeBigrams(tokens) {
-  const out = new Set();
-  for (let i = 0; i < tokens.length - 1; i++) out.add(`${tokens[i]} ${tokens[i + 1]}`);
-  return out;
-}
-function extractUrlHosts(text) {
-  const hosts = new Set();
-  const s = String(text || "");
-  const re = /https?:\/\/([^\/\s]+)/gi;
-  let m;
-  while ((m = re.exec(s))) hosts.add(m[1].toLowerCase());
-  return hosts;
-}
-function sharedHostBonus(currentHosts, candidateHosts) {
-  if (!currentHosts.size || !candidateHosts.size) return 0;
-  let shared = 0;
-  for (const h of currentHosts) if (candidateHosts.has(h)) shared++;
-  return shared * SHARED_HOST_BONUS;
-}
-function buildIdfMap(candidateDocsTokens) {
-  const df = new Map();
-  const N = candidateDocsTokens.length || 1;
-  for (const tokenSet of candidateDocsTokens) {
-    for (const tok of tokenSet) df.set(tok, (df.get(tok) || 0) + 1);
-  }
-  const idf = new Map();
-  for (const [tok, dfi] of df.entries()) {
-    idf.set(tok, Math.log((N + 1) / (dfi + 1)) + 1);
-  }
-  return idf;
-}
-function overlapScoreIdf(currentTokenSet, candidateTokenSet, idfMap) {
-  let score = 0;
-  for (const tok of candidateTokenSet) {
-    if (!currentTokenSet.has(tok)) continue;
-    score += idfMap.get(tok) || 1;
-  }
-  return score;
-}
-function bigramBonus(currentBigrams, candidateTextLower) {
-  let bonus = 0;
-  for (const bg of currentBigrams) if (candidateTextLower.includes(bg)) bonus += BIGRAM_BONUS;
-  return bonus;
-}
-function recencyBonus(updatedAtIso) {
-  const ageDays = daysAgoFromIso(updatedAtIso);
-  if (ageDays == null) return 0;
-
-  if (ageDays <= RECENT_DAYS) {
-    const frac = (RECENT_DAYS - ageDays) / RECENT_DAYS;
-    return frac * RECENCY_BONUS_MAX;
-  }
-  if (ageDays >= OLD_DAYS) return -RECENCY_BONUS_MAX;
-
-  const frac = (ageDays - RECENT_DAYS) / (OLD_DAYS - RECENT_DAYS);
-  return -frac * (RECENCY_BONUS_MAX / 2);
 }
 
 function normalizeLoose(s) {
@@ -246,8 +121,6 @@ function prepareTagRules(rules) {
     priority: idx,
     tag: String(r.tag || "").trim(),
     tagNorm: normalizeLoose(r.tag || ""),
-    keywords: Array.isArray(r.keywords) ? r.keywords.filter(Boolean) : [],
-    keywordsNorm: Array.isArray(r.keywords) ? r.keywords.map(k => normalizeLoose(k)).filter(Boolean) : [],
     handledBy: String(r.handledBy || "").trim(),
     helpfulLinks: Array.isArray(r.helpfulLinks) ? r.helpfulLinks.filter(Boolean) : [],
     notes: String(r.notes || "").trim()
@@ -266,96 +139,6 @@ function findMappedTagRule(ticketTags) {
   return null;
 }
 
-function scoreKeywordRule(rule, textNorm) {
-  let score = 0;
-
-  for (const kw of rule.keywordsNorm) {
-    if (!kw) continue;
-
-    if (textNorm.includes(kw)) {
-      score += kw.split(" ").length > 1 ? 12 : 8;
-      continue;
-    }
-
-    const parts = kw.split(" ").filter(Boolean);
-    if (parts.length > 1 && parts.every(p => textNorm.includes(p))) {
-      score += 6;
-    }
-  }
-
-  return score;
-}
-
-function findKeywordMatches(text) {
-  const textNorm = normalizeLoose(text);
-  const matches = [];
-
-  for (const rule of TAG_RULES) {
-    const score = scoreKeywordRule(rule, textNorm);
-    if (score > 0) {
-      matches.push({ rule, score });
-    }
-  }
-
-  matches.sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    return a.rule.priority - b.rule.priority;
-  });
-
-  return matches;
-}
-
-function buildHierarchyPayload(ticket, ticketText) {
-  const ticketTags = Array.isArray(ticket?.tags) ? ticket.tags : [];
-  const mappedTagRule = findMappedTagRule(ticketTags);
-
-  if (mappedTagRule) {
-    return {
-      matchMode: "tag",
-      matchedTag: mappedTagRule.tag,
-      suggestedTags: [],
-      handledBy: mappedTagRule.handledBy || "",
-      helpfulLinks: mappedTagRule.helpfulLinks.map(url => ({ label: url, url })),
-      processNotes: mappedTagRule.notes ? [mappedTagRule.notes] : [],
-      hierarchyConfidence: "High (mapped tag)"
-    };
-  }
-
-  const keywordMatches = findKeywordMatches(ticketText);
-  const best = keywordMatches[0] || null;
-  const suggestedTags = keywordMatches.slice(0, 2).map(m => m.rule.tag);
-
-  if (best) {
-    return {
-      matchMode: "keyword",
-      matchedTag: best.rule.tag,
-      suggestedTags,
-      handledBy: best.rule.handledBy || "",
-      helpfulLinks: best.rule.helpfulLinks.map(url => ({ label: url, url })),
-      processNotes: best.rule.notes ? [best.rule.notes] : [],
-      hierarchyConfidence: best.score >= 20 ? "High (keyword match)" : "Possible (keyword match)"
-    };
-  }
-
-  return {
-    matchMode: "fallback",
-    matchedTag: null,
-    suggestedTags: [],
-    handledBy: "",
-    helpfulLinks: [],
-    processNotes: [],
-    hierarchyConfidence: "No hierarchy match"
-  };
-}
-
-function getTicketText(ticket) {
-  return `${ticket.subject || ""}\n${ticket.description_text || stripHtml(ticket.description) || ""}`;
-}
-
-/* =========================
-   FRESHDESK SETUP
-   ========================= */
-
 const rawDomain = process.env.FRESHDESK_DOMAIN;
 const freshdeskDomain = sanitizeDomain(rawDomain);
 const baseURL = buildBaseUrl(freshdeskDomain);
@@ -372,7 +155,7 @@ console.log("Loaded tag rules:", TAG_RULES.length);
 const fd = axios.create({
   baseURL,
   auth: { username: FRESHDESK_API_KEY, password: "X" },
-  timeout: 20000,
+  timeout: 20000
 });
 
 async function searchTicketsPagedRawQuery(rawQuery, maxPagesRequested = 10) {
@@ -406,7 +189,7 @@ async function getSalesHelpPoolTicketsCached() {
         searchTicketsPagedRawQuery("status:2", 10),
         searchTicketsPagedRawQuery("status:3", 10),
         searchTicketsPagedRawQuery("status:4", 10),
-        searchTicketsPagedRawQuery("status:5", 10),
+        searchTicketsPagedRawQuery("status:5", 10)
       ]);
       const tickets = uniqById([...s2, ...s3, ...s4, ...s5]).filter(t => String(t.group_id) === SALES_HELP_GROUP_ID);
       poolCache = { ts: Date.now(), tickets };
@@ -439,33 +222,28 @@ function to429Error(err) {
   return { retryAfter };
 }
 
-/* =========================
-   FAST CORE + TAG-ONLY SIMILAR
-   ========================= */
-
 function buildCorePayload(ticket) {
   const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
-  const ticketText = getTicketText(ticket);
-  const hierarchy = buildHierarchyPayload(ticket, ticketText);
+  const mappedTagRule = findMappedTagRule(tags);
 
-  if (tags.length > 0) {
-    if (hierarchy.matchMode === "tag") {
-      return {
-        ticketId: String(ticket.id),
-        subject: ticket.subject || "",
-        tags,
-        matchMode: "tag",
-        matchedTag: hierarchy.matchedTag,
-        suggestedTags: [],
-        handledBy: hierarchy.handledBy,
-        helpfulLinks: hierarchy.helpfulLinks,
-        processNotes: hierarchy.processNotes,
-        hierarchyConfidence: hierarchy.hierarchyConfidence,
-        suggestedExternalContacts: [],
-        message: "Tag mode ✅"
-      };
-    }
+  if (tags.length > 0 && mappedTagRule) {
+    return {
+      ticketId: String(ticket.id),
+      subject: ticket.subject || "",
+      tags,
+      matchMode: "tag",
+      matchedTag: mappedTagRule.tag,
+      suggestedTags: [],
+      handledBy: mappedTagRule.handledBy || "",
+      helpfulLinks: mappedTagRule.helpfulLinks.map(url => ({ label: url, url })),
+      processNotes: mappedTagRule.notes ? [mappedTagRule.notes] : [],
+      hierarchyConfidence: "High (mapped tag)",
+      suggestedExternalContacts: [],
+      message: "Tag mode ✅"
+    };
+  }
 
+  if (tags.length > 0 && !mappedTagRule) {
     return {
       ticketId: String(ticket.id),
       subject: ticket.subject || "",
@@ -482,38 +260,20 @@ function buildCorePayload(ticket) {
     };
   }
 
-  if (hierarchy.matchMode === "keyword") {
-    return {
-      ticketId: String(ticket.id),
-      subject: ticket.subject || "",
-      tags: [],
-      matchMode: "keyword",
-      matchedTag: hierarchy.matchedTag,
-      suggestedTags: hierarchy.suggestedTags,
-      handledBy: hierarchy.handledBy,
-      helpfulLinks: hierarchy.helpfulLinks,
-      processNotes: hierarchy.processNotes,
-      hierarchyConfidence: hierarchy.hierarchyConfidence,
-      suggestedExternalContacts: hierarchy.handledBy
-        ? [{ email: hierarchy.handledBy, confidence: "High (keyword match)", source: "keyword" }]
-        : [],
-      message: "Keyword mode ✅"
-    };
-  }
-
+  // NO TAG = NO INFERENCE
   return {
     ticketId: String(ticket.id),
     subject: ticket.subject || "",
     tags: [],
-    matchMode: "fallback",
+    matchMode: "no_tag",
     matchedTag: null,
     suggestedTags: [],
     handledBy: "",
     helpfulLinks: [],
     processNotes: [],
-    hierarchyConfidence: "No hierarchy match",
+    hierarchyConfidence: "No tag applied",
     suggestedExternalContacts: [],
-    message: "Fallback mode ✅"
+    message: "No tag applied ✅"
   };
 }
 
@@ -528,12 +288,11 @@ async function findRecentSameTagTickets(currentTicketId, tagToMatch, domainForUr
   }
 
   const pool = await getSalesHelpPoolTicketsCached();
-  const candidates = pool
-    .sort((a, b) => {
-      const aMs = parseDateMs(a.updated_at || a.created_at) || 0;
-      const bMs = parseDateMs(b.updated_at || b.created_at) || 0;
-      return bMs - aMs;
-    });
+  const candidates = pool.sort((a, b) => {
+    const aMs = parseDateMs(a.updated_at || a.created_at) || 0;
+    const bMs = parseDateMs(b.updated_at || b.created_at) || 0;
+    return bMs - aMs;
+  });
 
   const found = [];
   let inspected = 0;
@@ -601,14 +360,10 @@ async function buildSimilarResponse(ticketId) {
       }
 
       const tags = Array.isArray(ticket?.tags) ? ticket.tags : [];
-      const hierarchy = buildHierarchyPayload(ticket, getTicketText(ticket));
+      const mappedTagRule = findMappedTagRule(tags);
 
-      // TAGGING IS KING:
-      // - if there is a mapped tag, pull same-tag recent tickets
-      // - if there is no tag, do not run semantic similarity at all
-      // - if there is an unmapped tag, show no related tickets for now
-      if (tags.length > 0 && hierarchy.matchMode === "tag") {
-        const sameTagTickets = await findRecentSameTagTickets(ticketId, hierarchy.matchedTag, freshdeskDomain);
+      if (tags.length > 0 && mappedTagRule) {
+        const sameTagTickets = await findRecentSameTagTickets(ticketId, mappedTagRule.tag, freshdeskDomain);
         return {
           ticketId: String(ticket.id),
           similarTickets: sameTagTickets
@@ -623,10 +378,6 @@ async function buildSimilarResponse(ticketId) {
   });
 }
 
-/* =========================
-   ROUTES
-   ========================= */
-
 app.get("/health", (req, res) => res.send("ok"));
 
 app.get("/config", (req, res) => {
@@ -635,7 +386,6 @@ app.get("/config", (req, res) => {
     return res.status(403).json({ error: "Forbidden" });
   }
   return res.json({
-    rules_loaded: (RULES_CONFIG?.rules || []).map(r => r.id),
     tag_rules_loaded: TAG_RULES.map(r => r.tag),
     cache: {
       POOL_CACHE_TTL_MS,

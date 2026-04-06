@@ -1,9 +1,9 @@
 [
   {
     "tag": "Account Reassignment",
-    "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct"],
+    "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct", "move these accounts", "move these accts"],
     "handledBy": "SalesOps",
-    "helpfulLinks": [],
+    "helpfulLinks": ["Sales ROE Handbook"],
     "notes": "Review account info, activity and territory before reassigning"
   },
   {
@@ -23,7 +23,7 @@
   {
     "tag": "Affiliate Program",
     "keywords": ["Affiliate"],
-    "handledBy": "",
+    "handledBy": "SalesOps",
     "helpfulLinks": ["https://scorpion.seismic.com/Link/Content/DCF4cJfg7MqMH8QQg7d6B9q2b9m3"],
     "notes": ""
   },
@@ -31,6 +31,13 @@
     "tag": "AHREFS Credits",
     "keywords": ["AHREFS", "ahref"],
     "handledBy": "Gabi, Tera or Luke",
+    "helpfulLinks": ["https://help.ahrefs.com/en/articles/6061658-what-actions-consume-credits"],
+    "notes": ""
+  },
+  {
+    "tag": "Bulk Updates",
+    "keywords": ["Move Accounts", "Move These Accounts", "List of Accounts", "Account List", "Move These To", "Reassign These To", "Give These To"],
+    "handledBy": "SalesOps",
     "helpfulLinks": [],
     "notes": ""
   },
@@ -61,13 +68,20 @@
     "handledBy": "Product Support",
     "helpfulLinks": ["https://docs.google.com/document/d/1Ql8TEKOG1G4agZMShsM5buId0sPMdzpJcSb-ZD7IYOo/edit?tab=t.0"],
     "notes": "Loop in Product Support if needed. Create child ticket. DO NOT add PS onto the email in freshdesk. Troubleshoot and loop in Product Support if needed. Always add them as a child ticket!"
-  },  
+  },
   {
     "tag": "CSX User Error",
     "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "Growth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact", "CSX User Error"],
     "handledBy": "Product Support",
     "helpfulLinks": ["https://docs.google.com/document/d/1Ql8TEKOG1G4agZMShsM5buId0sPMdzpJcSb-ZD7IYOo/edit?tab=t.0"],
-    "notes": "Loop in Product Support if needed. Create child ticket. DO NOT add PS onto the email in freshdesk. Troubleshoot and loop in Product Support if needed. Always add them as a child ticket!"
+    "notes": "Loop in Product Support if needed. Create child ticket. DO NOT add PS onto the email in freshdesk."
+  },
+  {
+    "tag": "Growth Advisor Error",
+    "keywords": ["CSX error", "500 error", "500 internal error", "GA error", "Groth Advisor Error", "Growth Advisor Error", "CS error", "GA stuck", "Growth Advisor Stuck", "GA Issue", "Growth Advisor Issue", "Primary Contact"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": [],
+    "notes": "Troubleshoot and loop in Product Support if needed. Always add them as a child ticket!"
   },
   {
     "tag": "delete contact",
@@ -113,7 +127,7 @@
   },
   {
     "tag": "Lead Convert",
-    "keywords": ["Lead Convert", "Convert Contact", "Convert Lead", "Contact Convert"],
+    "keywords": ["Lead Convert", "Convert Contact", "Convert Lead"],
     "handledBy": "SalesOps",
     "helpfulLinks": [],
     "notes": ""
@@ -121,7 +135,7 @@
   {
     "tag": "Meeting Disposition Error, Meeting Disposition Update",
     "keywords": ["Dispo", "Disposition", "Meeting Error", "Meeting Complete", "Meeting Attribution"],
-    "handledBy": "",
+    "handledBy": "SalesOps",
     "helpfulLinks": [],
     "notes": "Opps can manually override these typically, but if not, loop in Kade"
   },
@@ -164,19 +178,19 @@
     "tag": "Record Reassignment",
     "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct", "put in name"],
     "handledBy": "SalesOps",
-    "helpfulLinks": [],
+    "helpfulLinks": ["Sales ROE Handbook"],
     "notes": ""
   },
   {
     "tag": "References",
-    "keywords": ["Existing Clients", "References", "Referrals", "Client Examples", "HVAC clients", "Roofing clients", "Legal clients", "etc"],
+    "keywords": ["Existing Clients", "References", "Client Examples"],
     "handledBy": "SalesOps",
-    "helpfulLinks": ["https://scorpion.lightning.force.com/lightning/r/Report/00ORj000005qpmjMAA/view?queryScope=userFolders"],
+    "helpfulLinks": ["https://scorpion.lightning.force.com/lightning/r/Report/00ORj000005qpmjMAA?queryScope=userFolders"],
     "notes": "Review salesforce report to identify potential referrals. Gabi/Treska are closest to this process"
   },
   {
     "tag": "Referrals",
-    "keywords": ["Referrals"],
+    "keywords": ["Referral"],
     "handledBy": "SalesOps",
     "helpfulLinks": [
       "https://scorpion.seismic.com/Link/Content/DCjWP4gcbfMHMGCC7DQMDC4PCRhd",
@@ -236,7 +250,7 @@
   {
     "tag": "Scorpion Convert",
     "keywords": ["Convert", "Scorpion Convert", "AI Convert", "Convert Demo"],
-    "handledBy": "Mandy Bennett (mandy.bennett@scorpion.co)",
+    "handledBy": "Adam Lloyd (adam.lloyd@scorpion.co), Mandy Bennett (mandy.bennett@scorpion.co)",
     "helpfulLinks": ["https://scorpion.seismic.com/apps/doccenter/aa7d0166-d97d-4995-bcb8-a22e4bc5a169/doc/%25252Flfb4efa247-4e38-4ae2-b223-2bb27886fdd3//?mode=view&searchId=a010d906-d211-4035-8c0f-643d0a6b3948&anchorId=bf59d613-22d8-4ad2-8b67-4562c60b509c"],
     "notes": ""
   },
@@ -259,7 +273,7 @@
     "keywords": ["Reduce", "setup fee", "set-up fee", "adjust price", "adjust pricing", "udpate pricing", "discount"],
     "handledBy": "SalesOps",
     "helpfulLinks": [],
-    "notes": ""
+    "notes": "We can make setup fee adjustments of 50%, contract discounts of 20%. Anything else requires manager/Jamie approval"
   },
   {
     "tag": "SPIFF/Compensation",
@@ -291,8 +305,22 @@
   },
   {
     "tag": "Welcome Call",
-    "keywords": ["Kick off", "kickoff", "onboarding", "welcome call", "sales transfer"],
+    "keywords": ["Kick off", "kickoff", "onboarding", "welcome call", "sales transfer", "transfer"],
     "handledBy": "Alyssa Lapp (alyssa.lapp@scorpion.co)",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Sales Transfer",
+    "keywords": ["Kick off", "kickoff", "onboarding", "welcome call", "sales transfer", "transfer"],
+    "handledBy": "Alyssa Lapp (alyssa.lapp@scorpion.co)",
+    "helpfulLinks": [],
+    "notes": ""
+  },
+  {
+    "tag": "Spanish Content",
+    "keywords": ["Spanish"],
+    "handledBy": "Spencer Lincoln",
     "helpfulLinks": [],
     "notes": ""
   },
@@ -302,5 +330,26 @@
     "handledBy": "Nate Reynolds",
     "helpfulLinks": [],
     "notes": "Verify the tool is not working (check the salesforce record, sometimes it just takes extra time to run). If there's an issue, loop in Nate."
+  },
+  {
+    "tag": "ClaudeAI",
+    "keywords": ["Claude", "Claud", "ClaudeAI"],
+    "handledBy": "ServiceDesk@scorpion.co",
+    "helpfulLinks": [],
+    "notes": "ServiceDesk manages the login access - reach out to them for troubleshooting."
+  },
+  {
+    "tag": "Business Cards",
+    "keywords": ["Business Card", "Business Cards", "Biz Card"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": ["https://scorpion.seismic.com/Link/Content/DCq4jXJFB4CCMGT23pDpRcCGVQ7j"],
+    "notes": ""
+  },
+  {
+    "tag": "ROEs",
+    "keywords": ["ROE", "ROEs", "Rules of Engagement", "Rule of Engagement"],
+    "handledBy": "SalesOps",
+    "helpfulLinks": ["Sales ROE Handbook"],
+    "notes": "Reference ROE handbook and determine account decision"
   }
 ]

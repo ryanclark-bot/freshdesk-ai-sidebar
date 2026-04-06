@@ -351,5 +351,12 @@
     "handledBy": "SalesOps",
     "helpfulLinks": ["Sales ROE Handbook"],
     "notes": "Reference ROE handbook and determine account decision"
+  },
+  {
+    "tag": "Navan",
+    "keywords": ["Travel", "Navan", "Expenses"],
+    "handledBy": "Tera",
+    "helpfulLinks": [],
+    "notes": "Tera manages Navan access/assignments/expenses"
   }
 ]

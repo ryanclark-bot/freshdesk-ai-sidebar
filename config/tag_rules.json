@@ -3,7 +3,7 @@
     "tag": "Account Reassignment",
     "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct", "move these accounts", "move these accts"],
     "handledBy": "SalesOps",
-    "helpfulLinks": ["Sales ROE Handbook"],
+    "helpfulLinks": ["https://scorpion.seismic.com/apps/doccenter/aa7d0166-d97d-4995-bcb8-a22e4bc5a169/doc/%25252Flf93f53da5-c5bd-4a1a-9177-2d582c101d7e//"],
     "notes": "Review account info, activity and territory before reassigning"
   },
   {
@@ -178,7 +178,7 @@
     "tag": "Record Reassignment",
     "keywords": ["Account in my name", "put in my name", "reassign", "re-assign", "move account", "Acct in my name", "move Acct", "put in name"],
     "handledBy": "SalesOps",
-    "helpfulLinks": ["Sales ROE Handbook"],
+    "helpfulLinks": ["https://scorpion.seismic.com/apps/doccenter/aa7d0166-d97d-4995-bcb8-a22e4bc5a169/doc/%25252Flf93f53da5-c5bd-4a1a-9177-2d582c101d7e//"],
     "notes": ""
   },
   {

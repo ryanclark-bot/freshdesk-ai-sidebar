@@ -512,26 +512,26 @@ app.post("/reference-request", async (req, res) => {
 
     const subject = `Reference Request | ${vertical || "Unknown Vertical"} | ${businessType || "Unknown Type"} | ${requesterEmail}`;
 
-    const ticketDescription = `
-Reference Request Submission
-
---- Seller Info ---
-Seller Email: ${requesterEmail}
-
---- Request Details ---
-Vertical: ${vertical}
-Business Type: ${businessType}
-Business Name & Salesforce Link (SF): ${businessSalesforceLink}
-
-Context:
-${referenceContext}
-
---- Timeline ---
-Date Needed: ${dateNeeded}
-
---- Metadata ---
-Source: Google Form
-`.trim();
+const ticketDescription = [
+  "Reference Request Submission",
+  "",
+  "Seller Info",
+  `Seller Email: ${requesterEmail}`,
+  "",
+  "Request Details",
+  `Vertical: ${vertical}`,
+  `Business Type: ${businessType}`,
+  `Business Name & Salesforce Link (SF): ${businessSalesforceLink}`,
+  "",
+  "Context",
+  referenceContext || "",
+  "",
+  "Timeline",
+  `Date Needed: ${dateNeeded}`,
+  "",
+  "Metadata",
+  "Source: Google Form"
+].join("\n");
 
     const payload = {
       email: requesterEmail,

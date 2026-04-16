@@ -378,6 +378,14 @@ async function buildSimilarResponse(ticketId) {
   });
 }
 
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 app.get("/health", (req, res) => res.send("ok"));
 
 app.get("/config", (req, res) => {
@@ -496,7 +504,8 @@ app.post("/reference-request", async (req, res) => {
 
   try {
     const {
-      sellerEmail = "",
+      requesterEmail = "",
+      sellerName = "",
       vertical = "",
       businessType = "",
       businessSalesforceLink = "",
@@ -504,27 +513,21 @@ app.post("/reference-request", async (req, res) => {
       dateNeeded = ""
     } = req.body || {};
 
-    const requesterEmail = String(sellerEmail || "").trim();
+    const cleanRequesterEmail = String(requesterEmail || "").trim();
+    const cleanSellerName = String(sellerName || "").trim();
 
-    if (!requesterEmail) {
-      return res.status(400).json({ error: "Missing sellerEmail" });
+    if (!cleanRequesterEmail) {
+      return res.status(400).json({ error: "Missing requesterEmail" });
     }
 
-    const subject = `Reference Request | ${vertical || "Unknown Vertical"} | ${businessType || "Unknown Type"} | ${requesterEmail}`;
+    const subject = `Reference Request | ${vertical || "Unknown Vertical"} | ${businessType || "Unknown Type"} | ${cleanSellerName || cleanRequesterEmail}`;
 
-function escapeHtml(value) {
-  return String(value || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-const ticketDescription = `
+    const ticketDescription = `
 <div><strong>Reference Request Submission</strong></div>
 <br>
 <div><strong>Seller Info</strong></div>
-<div>Seller Email: ${escapeHtml(requesterEmail)}</div>
+<div>Seller Name: ${escapeHtml(cleanSellerName)}</div>
+<div>Requester Email: ${escapeHtml(cleanRequesterEmail)}</div>
 <br>
 <div><strong>Request Details</strong></div>
 <div>Vertical: ${escapeHtml(vertical)}</div>
@@ -542,7 +545,7 @@ const ticketDescription = `
 `.trim();
 
     const payload = {
-      email: requesterEmail,
+      email: cleanRequesterEmail,
       subject,
       description: ticketDescription,
       status: 2,

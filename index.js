@@ -261,7 +261,6 @@ function buildCorePayload(ticket) {
     };
   }
 
-  // NO TAG = NO INFERENCE
   return {
     ticketId: String(ticket.id),
     subject: ticket.subject || "",
@@ -494,48 +493,44 @@ app.post("/reference-request", async (req, res) => {
 
   try {
     const {
-      submitterEmail = "",
-      sellerName = "",
       sellerEmail = "",
+      vertical = "",
       businessType = "",
-      salesforceInfo = "",
-      description = "",
+      businessSalesforceLink = "",
+      referenceContext = "",
       dateNeeded = ""
     } = req.body || {};
 
-    const requesterName = String(sellerName || "").trim() || "Unknown Seller";
-    const requesterEmail = String(sellerEmail || submitterEmail || "").trim();
+    const requesterEmail = String(sellerEmail || "").trim();
 
     if (!requesterEmail) {
-      return res.status(400).json({ error: "Missing requester email" });
+      return res.status(400).json({ error: "Missing sellerEmail" });
     }
 
-    const subject = `Reference Request | ${businessType || "Unknown"} | ${requesterName} | ${dateNeeded || "No Date"}`;
+    const subject = `Reference Request | ${vertical || "Unknown Vertical"} | ${businessType || "Unknown Type"} | ${requesterEmail}`;
 
     const ticketDescription = `
 Reference Request Submission
 
 --- Seller Info ---
-Seller Name: ${requesterName}
 Seller Email: ${requesterEmail}
 
 --- Request Details ---
+Vertical: ${vertical}
 Business Type: ${businessType}
-Salesforce (SF): ${salesforceInfo}
+Business Name & Salesforce Link (SF): ${businessSalesforceLink}
 
-Description:
-${description}
+Context:
+${referenceContext}
 
 --- Timeline ---
 Date Needed: ${dateNeeded}
 
 --- Metadata ---
-Submitted By: ${submitterEmail}
 Source: Google Form
 `.trim();
 
     const payload = {
-      name: requesterName,
       email: requesterEmail,
       subject,
       description: ticketDescription,

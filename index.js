@@ -490,6 +490,9 @@ app.post("/reference-request", async (req, res) => {
   if (!FRESHDESK_API_KEY) {
     return res.status(500).json({ error: "Server misconfigured: missing FRESHDESK_API_KEY" });
   }
+  if (!SALES_HELP_GROUP_ID) {
+    return res.status(500).json({ error: "Server misconfigured: missing SALES_HELP_GROUP_ID" });
+  }
 
   try {
     const {
@@ -537,6 +540,7 @@ Source: Google Form
       status: 2,
       priority: 1,
       source: 2,
+      group_id: Number(SALES_HELP_GROUP_ID),
       tags: ["Client Reference"]
     };
 

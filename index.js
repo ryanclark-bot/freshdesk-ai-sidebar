@@ -512,26 +512,34 @@ app.post("/reference-request", async (req, res) => {
 
     const subject = `Reference Request | ${vertical || "Unknown Vertical"} | ${businessType || "Unknown Type"} | ${requesterEmail}`;
 
-const ticketDescription = [
-  "Reference Request Submission",
-  "",
-  "Seller Info",
-  `Seller Email: ${requesterEmail}`,
-  "",
-  "Request Details",
-  `Vertical: ${vertical}`,
-  `Business Type: ${businessType}`,
-  `Business Name & Salesforce Link (SF): ${businessSalesforceLink}`,
-  "",
-  "Context",
-  referenceContext || "",
-  "",
-  "Timeline",
-  `Date Needed: ${dateNeeded}`,
-  "",
-  "Metadata",
-  "Source: Google Form"
-].join("\n");
+function escapeHtml(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+const ticketDescription = `
+<div><strong>Reference Request Submission</strong></div>
+<br>
+<div><strong>Seller Info</strong></div>
+<div>Seller Email: ${escapeHtml(requesterEmail)}</div>
+<br>
+<div><strong>Request Details</strong></div>
+<div>Vertical: ${escapeHtml(vertical)}</div>
+<div>Business Type: ${escapeHtml(businessType)}</div>
+<div>Business Name &amp; Salesforce Link (SF): ${escapeHtml(businessSalesforceLink)}</div>
+<br>
+<div><strong>Context</strong></div>
+<div>${escapeHtml(referenceContext).replace(/\n/g, "<br>")}</div>
+<br>
+<div><strong>Timeline</strong></div>
+<div>Date Needed: ${escapeHtml(dateNeeded)}</div>
+<br>
+<div><strong>Metadata</strong></div>
+<div>Source: Google Form</div>
+`.trim();
 
     const payload = {
       email: requesterEmail,

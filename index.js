@@ -7,6 +7,7 @@ const path = require("path");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
 function readJson(filePath) {
   const abs = path.join(__dirname, filePath);
@@ -475,6 +476,90 @@ app.get("/suggest", async (req, res) => {
         retryAfter: rl.retryAfter || null
       });
     }
+    return res.status(err?.response?.status || 500).json({
+      error: err.message || String(err),
+      freshdeskStatus: err.response?.status || null,
+      freshdeskData: err.response?.data || null
+    });
+  }
+});
+
+app.post("/reference-request", async (req, res) => {
+  if (!baseURL) {
+    return res.status(500).json({ error: "Server misconfigured: invalid FRESHDESK_DOMAIN" });
+  }
+  if (!FRESHDESK_API_KEY) {
+    return res.status(500).json({ error: "Server misconfigured: missing FRESHDESK_API_KEY" });
+  }
+
+  try {
+    const {
+      submitterEmail = "",
+      sellerName = "",
+      sellerEmail = "",
+      businessType = "",
+      salesforceInfo = "",
+      description = "",
+      dateNeeded = ""
+    } = req.body || {};
+
+    const requesterName = String(sellerName || "").trim() || "Unknown Seller";
+    const requesterEmail = String(sellerEmail || submitterEmail || "").trim();
+
+    if (!requesterEmail) {
+      return res.status(400).json({ error: "Missing requester email" });
+    }
+
+    const subject = `Reference Request | ${businessType || "Unknown"} | ${requesterName} | ${dateNeeded || "No Date"}`;
+
+    const ticketDescription = `
+Reference Request Submission
+
+--- Seller Info ---
+Seller Name: ${requesterName}
+Seller Email: ${requesterEmail}
+
+--- Request Details ---
+Business Type: ${businessType}
+Salesforce (SF): ${salesforceInfo}
+
+Description:
+${description}
+
+--- Timeline ---
+Date Needed: ${dateNeeded}
+
+--- Metadata ---
+Submitted By: ${submitterEmail}
+Source: Google Form
+`.trim();
+
+    const payload = {
+      name: requesterName,
+      email: requesterEmail,
+      subject,
+      description: ticketDescription,
+      status: 2,
+      priority: 1,
+      source: 2,
+      tags: ["Client Reference"]
+    };
+
+    const { data } = await fd.post("/tickets", payload);
+
+    return res.json({
+      ok: true,
+      ticketId: data?.id || null
+    });
+  } catch (err) {
+    const rl = to429Error(err);
+    if (rl) {
+      return res.status(429).json({
+        error: "Freshdesk rate limit (429). Wait a bit and retry.",
+        retryAfter: rl.retryAfter || null
+      });
+    }
+
     return res.status(err?.response?.status || 500).json({
       error: err.message || String(err),
       freshdeskStatus: err.response?.status || null,
